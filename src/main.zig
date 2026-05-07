@@ -1713,6 +1713,13 @@ fn printWorkspaceUsage() void {
         \\      --only-secrets       Report only high/critical findings
         \\      --exclude            Repeatable path substring to skip during scanning
         \\      --fail-on            Exit non-zero when findings meet or exceed the threshold
+        \\      --llm-triage MODE    LLM triage of findings: off | dry-run | external
+        \\                           dry-run prints privacy-safe envelopes without sending
+        \\                           external sends envelopes to the agent's configured
+        \\                           provider (anthropic/openai/openrouter/ollama/...)
+        \\                           (raw secret values are NEVER included in envelopes)
+        \\      --llm-model NAME     Model id override (default: cfg.agents.defaults.model.primary)
+        \\      --llm-provider NAME  Provider override (default: cfg.default_provider)
         \\
     , .{WORKSPACE_SUBCOMMANDS}), .{});
 }
@@ -3275,6 +3282,32 @@ fn runWorkspaceAudit(allocator: std.mem.Allocator, args: []const []const u8, cfg
                 printWorkspaceUsage();
                 std_compat.process.exit(1);
             };
+        } else if (std.mem.eql(u8, arg, "--llm-triage")) {
+            i += 1;
+            if (i >= args.len) {
+                std.debug.print("Missing value for --llm-triage (off|dry-run|external)\n\n", .{});
+                printWorkspaceUsage();
+                std_compat.process.exit(1);
+            }
+            options.triage_mode = yc.workspace_audit.TriageMode.parse(args[i]) orelse {
+                std.debug.print("Invalid --llm-triage value: {s} (use off|dry-run|external)\n\n", .{args[i]});
+                printWorkspaceUsage();
+                std_compat.process.exit(1);
+            };
+        } else if (std.mem.eql(u8, arg, "--llm-model")) {
+            i += 1;
+            if (i >= args.len) {
+                std.debug.print("Missing value for --llm-model\n\n", .{});
+                std_compat.process.exit(1);
+            }
+            options.triage_model = args[i];
+        } else if (std.mem.eql(u8, arg, "--llm-provider")) {
+            i += 1;
+            if (i >= args.len) {
+                std.debug.print("Missing value for --llm-provider\n\n", .{});
+                std_compat.process.exit(1);
+            }
+            options.triage_provider = args[i];
         } else {
             std.debug.print("Unknown workspace audit option: {s}\n\n", .{arg});
             printWorkspaceUsage();
@@ -3283,6 +3316,26 @@ fn runWorkspaceAudit(allocator: std.mem.Allocator, args: []const []const u8, cfg
     }
 
     options.exclude_patterns = exclude_patterns.items;
+
+    if (options.triage_mode == .external) {
+        if (options.triage_provider == null) {
+            options.triage_provider = cfg.default_provider;
+        }
+        if (options.triage_model == null) {
+            options.triage_model = cfg.default_model;
+        }
+        if (options.triage_model == null) {
+            std.debug.print("workspace audit: no model configured. Set agents.defaults.model.primary or pass --llm-model.\n", .{});
+            std_compat.process.exit(1);
+        }
+        const provider_name = options.triage_provider.?;
+        if (cfg.getProviderKey(provider_name)) |key| {
+            options.triage_api_key = key;
+        } else {
+            std.debug.print("workspace audit: no api_key for provider '{s}'. Set models.providers.{s}.api_key in config.\n", .{ provider_name, provider_name });
+            std_compat.process.exit(1);
+        }
+    }
 
     var git_modes: usize = 0;
     if (options.staged) git_modes += 1;

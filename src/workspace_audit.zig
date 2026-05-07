@@ -6,6 +6,7 @@ const admin_output = @import("admin_output.zig");
 const scrub = @import("providers/scrub.zig");
 const util = @import("util.zig");
 const process_util = @import("tools/process_util.zig");
+const audit = @import("audit/root.zig");
 
 const Allocator = std.mem.Allocator;
 
@@ -137,6 +138,19 @@ pub const FindingSource = enum {
     }
 };
 
+pub const TriageMode = enum {
+    off,
+    dry_run,
+    external,
+
+    pub fn parse(text: []const u8) ?TriageMode {
+        if (std.mem.eql(u8, text, "off")) return .off;
+        if (std.mem.eql(u8, text, "dry-run") or std.mem.eql(u8, text, "dry_run")) return .dry_run;
+        if (std.mem.eql(u8, text, "external") or std.mem.eql(u8, text, "on")) return .external;
+        return null;
+    }
+};
+
 pub const Options = struct {
     workspace_dir: []const u8,
     json: bool = false,
@@ -146,6 +160,11 @@ pub const Options = struct {
     fail_on: FailureThreshold = .high,
     only_secrets: bool = false,
     exclude_patterns: []const []const u8 = &.{},
+    triage_mode: TriageMode = .off,
+    triage_provider: ?[]const u8 = null,
+    triage_model: ?[]const u8 = null,
+    triage_api_key: ?[]const u8 = null,
+    audit_log_path: ?[]const u8 = null,
 };
 
 pub const Finding = struct {
@@ -156,11 +175,20 @@ pub const Finding = struct {
     line: ?usize,
     source: FindingSource,
     preview: []u8,
+    // Internal fields for LLM triage envelope construction. Not serialized.
+    raw_line: ?[]u8 = null,
+    detected_value: ?[]u8 = null,
+    assignment_key: ?[]u8 = null,
+    assignment_operator: ?[]u8 = null,
 
-    fn deinit(self: *Finding, allocator: Allocator) void {
+    pub fn deinit(self: *Finding, allocator: Allocator) void {
         allocator.free(self.rule);
         allocator.free(self.path);
         allocator.free(self.preview);
+        if (self.raw_line) |v| allocator.free(v);
+        if (self.detected_value) |v| allocator.free(v);
+        if (self.assignment_key) |v| allocator.free(v);
+        if (self.assignment_operator) |v| allocator.free(v);
     }
 };
 
@@ -199,6 +227,9 @@ const DetectedRule = struct {
     severity: Severity,
     confidence: Confidence,
     rule: []const u8,
+    detected_value: ?[]const u8 = null,
+    assignment_key: ?[]const u8 = null,
+    assignment_operator: ?[]const u8 = null,
 };
 
 const PathCategory = enum {
@@ -216,6 +247,23 @@ pub fn run(allocator: Allocator, options: Options) !u8 {
     var report = try buildReport(allocator, resolved_workspace, options);
     defer report.deinit(allocator);
 
+    var maybe_stats: ?audit.TriageStats = null;
+    if (options.triage_mode != .off) {
+        const home_env = std_compat.process.getEnvVarOwned(allocator, "HOME") catch null;
+        defer if (home_env) |h| allocator.free(h);
+        const home: []const u8 = home_env orelse ".";
+
+        var owned_log_path: ?[]u8 = null;
+        defer if (owned_log_path) |p| allocator.free(p);
+        const log_path: []const u8 = if (options.audit_log_path) |p| p else blk: {
+            const path = try std.fmt.allocPrint(allocator, "{s}/.nullclaw/audit-log.jsonl", .{home});
+            owned_log_path = path;
+            break :blk path;
+        };
+
+        maybe_stats = try audit.triager.runTriage(allocator, &report, options, log_path);
+    }
+
     const rendered = if (options.json)
         try renderJson(allocator, report, options.fail_on)
     else
@@ -225,6 +273,12 @@ pub fn run(allocator: Allocator, options: Options) !u8 {
     try admin_output.writeStdoutBytes(rendered);
     if (rendered.len == 0 or rendered[rendered.len - 1] != '\n') {
         try admin_output.writeStdoutBytes("\n");
+    }
+
+    if (maybe_stats) |stats| {
+        const stats_line = try audit.triager.renderStatsText(allocator, stats);
+        defer allocator.free(stats_line);
+        try admin_output.writeStdoutBytes(stats_line);
     }
 
     return if (report.exceedsThreshold(options.fail_on)) 1 else 0;
@@ -603,6 +657,7 @@ const AssignmentMatch = struct {
     quoted: bool,
     keyword_score: u8,
     strong_keyword: bool,
+    operator: []const u8,
 };
 
 fn matchSecretAssignment(line: []const u8) ?AssignmentMatch {
@@ -611,6 +666,8 @@ fn matchSecretAssignment(line: []const u8) ?AssignmentMatch {
     const key = extractAssignmentKey(lhs) orelse return null;
     const key_traits = analyzeSecretKeyName(key);
     if (key_traits.score == 0) return null;
+
+    const operator: []const u8 = if (line[sep_idx] == ':') ":" else "=";
 
     var pos = sep_idx + 1;
     while (pos < line.len and (line[pos] == ' ' or line[pos] == '"' or line[pos] == '\'')) pos += 1;
@@ -631,6 +688,7 @@ fn matchSecretAssignment(line: []const u8) ?AssignmentMatch {
         .quoted = quoted,
         .keyword_score = key_traits.score,
         .strong_keyword = key_traits.strong,
+        .operator = operator,
     };
 }
 
@@ -710,6 +768,16 @@ fn appendFinding(
 ) !void {
     if (options.only_secrets and rule.severity.rank() < Severity.high.rank()) return;
 
+    const collect = options.triage_mode != .off;
+    const raw_line: ?[]u8 = if (collect) try allocator.dupe(u8, raw_preview) else null;
+    errdefer if (raw_line) |v| allocator.free(v);
+    const detected_value: ?[]u8 = if (collect and rule.detected_value != null) try allocator.dupe(u8, rule.detected_value.?) else null;
+    errdefer if (detected_value) |v| allocator.free(v);
+    const assignment_key: ?[]u8 = if (collect and rule.assignment_key != null) try allocator.dupe(u8, rule.assignment_key.?) else null;
+    errdefer if (assignment_key) |v| allocator.free(v);
+    const assignment_operator: ?[]u8 = if (collect and rule.assignment_operator != null) try allocator.dupe(u8, rule.assignment_operator.?) else null;
+    errdefer if (assignment_operator) |v| allocator.free(v);
+
     try findings.append(allocator, .{
         .severity = rule.severity,
         .confidence = rule.confidence,
@@ -718,6 +786,10 @@ fn appendFinding(
         .line = line_no,
         .source = source,
         .preview = try buildPreview(allocator, raw_preview),
+        .raw_line = raw_line,
+        .detected_value = detected_value,
+        .assignment_key = assignment_key,
+        .assignment_operator = assignment_operator,
     });
 }
 
@@ -849,6 +921,9 @@ fn classifySecretAssignment(
         .severity = severity,
         .confidence = confidence,
         .rule = if (std.mem.indexOf(u8, path, ".env") != null) "env_secret_assignment" else "secret_assignment",
+        .detected_value = value,
+        .assignment_key = assignment.key,
+        .assignment_operator = assignment.operator,
     };
 }
 
@@ -1064,7 +1139,7 @@ fn containsHighEntropyCandidate(line: []const u8) bool {
                 !looksPlaceholder(candidate) and
                 !looksLikeUuid(candidate) and
                 !looksLikeGitCommitHash(candidate) and
-                computeShannonEntropy(candidate) >= 4.0)
+                audit.envelope.computeShannonEntropy(candidate) >= 4.0)
             {
                 return true;
             }
@@ -1084,23 +1159,6 @@ fn candidateFromEntropyRun(candidate_run: []const u8) ?[]const u8 {
 
 fn isEntropyCharset(ch: u8) bool {
     return std.ascii.isAlphanumeric(ch) or ch == '+' or ch == '/' or ch == '=' or ch == '_' or ch == '-';
-}
-
-fn computeShannonEntropy(text: []const u8) f64 {
-    if (text.len == 0) return 0.0;
-
-    var counts = [_]usize{0} ** 256;
-    for (text) |ch| counts[ch] += 1;
-
-    const len_f: f64 = @floatFromInt(text.len);
-    var entropy: f64 = 0.0;
-    for (counts) |count| {
-        if (count == 0) continue;
-        const count_f: f64 = @floatFromInt(count);
-        const p = count_f / len_f;
-        entropy -= p * @log2(p);
-    }
-    return entropy;
 }
 
 fn looksLikeGitCommitHash(text: []const u8) bool {
