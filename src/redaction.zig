@@ -19,6 +19,13 @@ pub const Config = struct {
     redact_card: bool = true,
     redact_id: bool = true,
     redact_tokens: bool = true,
+    /// If true, redact() also records original PII alongside the placeholder so
+    /// later unredact() calls can rehydrate. Off by default — the one-way
+    /// "HMAC-only" contract holds. Opt in when the same Redactor is used to
+    /// rehydrate tool args / display text within the agent process. Originals
+    /// then live in process RAM for the redactor's lifetime; on-disk state is
+    /// untouched.
+    record_originals: bool = false,
 };
 
 pub const Redactor = struct {
@@ -29,6 +36,11 @@ pub const Redactor = struct {
     card_map: std.StringHashMap(u32),
     id_map: std.StringHashMap(u32),
     token_map: std.StringHashMap(u32),
+    /// Reverse lookup populated only when `config.record_originals == true`.
+    /// Maps full placeholder string ("[EMAIL_1]") → original PII slice owned
+    /// by `allocator`. Drives unredact(). Threat model: same as Agent.history
+    /// (plaintext already resident in process); on-disk surface untouched.
+    placeholder_to_original: std.StringHashMap([]u8),
     fingerprint_key: [32]u8,
     email_count: u32,
     phone_count: u32,
@@ -47,6 +59,7 @@ pub const Redactor = struct {
             .card_map = std.StringHashMap(u32).init(allocator),
             .id_map = std.StringHashMap(u32).init(allocator),
             .token_map = std.StringHashMap(u32).init(allocator),
+            .placeholder_to_original = std.StringHashMap([]u8).init(allocator),
             .fingerprint_key = fingerprint_key,
             .email_count = 0,
             .phone_count = 0,
@@ -67,6 +80,8 @@ pub const Redactor = struct {
         self.card_map.deinit();
         self.id_map.deinit();
         self.token_map.deinit();
+        freeOriginalsMap(&self.placeholder_to_original, self.allocator);
+        self.placeholder_to_original.deinit();
     }
 
     pub fn reset(self: *Redactor) void {
@@ -75,6 +90,7 @@ pub const Redactor = struct {
         clearMap(&self.card_map, self.allocator);
         clearMap(&self.id_map, self.allocator);
         clearMap(&self.token_map, self.allocator);
+        clearOriginalsMap(&self.placeholder_to_original, self.allocator);
         self.email_count = 0;
         self.phone_count = 0;
         self.card_count = 0;
@@ -101,49 +117,61 @@ pub const Redactor = struct {
             if (self.config.redact_tokens) {
                 if (matchKeyValueSecret(input, i)) |kv| {
                     try out.appendSlice(dest_allocator, input[i..kv.value_start]);
-                    const id = try self.intern(&self.token_map, &self.token_count, input[kv.value_start..kv.value_end]);
+                    const original = input[kv.value_start..kv.value_end];
+                    const id = try self.intern(&self.token_map, &self.token_count, original);
                     try writePlaceholder(&out, dest_allocator, "TOKEN", id);
+                    try self.recordOriginal("TOKEN", id, original);
                     i = kv.value_end;
                     continue;
                 }
                 if (matchBearerToken(input, i)) |bt| {
                     try out.appendSlice(dest_allocator, input[i .. i + bt.prefix_len]);
-                    const id = try self.intern(&self.token_map, &self.token_count, input[i + bt.prefix_len .. bt.end]);
+                    const original = input[i + bt.prefix_len .. bt.end];
+                    const id = try self.intern(&self.token_map, &self.token_count, original);
                     try writePlaceholder(&out, dest_allocator, "TOKEN", id);
+                    try self.recordOriginal("TOKEN", id, original);
                     i = bt.end;
                     continue;
                 }
                 if (matchPrefixToken(input, i)) |pt| {
-                    const id = try self.intern(&self.token_map, &self.token_count, input[i..pt.end]);
+                    const original = input[i..pt.end];
+                    const id = try self.intern(&self.token_map, &self.token_count, original);
                     try writePlaceholder(&out, dest_allocator, "TOKEN", id);
+                    try self.recordOriginal("TOKEN", id, original);
                     i = pt.end;
                     continue;
                 }
             }
             if (self.config.redact_email) {
                 if (matchEmail(input, i)) |em| {
-                    const id = try self.intern(&self.email_map, &self.email_count, input[em.start..em.end]);
+                    const original = input[em.start..em.end];
+                    const id = try self.intern(&self.email_map, &self.email_count, original);
                     try writePlaceholder(&out, dest_allocator, "EMAIL", id);
+                    try self.recordOriginal("EMAIL", id, original);
                     i = em.end;
                     continue;
                 }
             }
             if (self.config.redact_card) {
                 if (matchCard(input, i)) |cd| {
+                    const original = input[cd.start..cd.end];
                     var normalized: [32]u8 = undefined;
-                    const key = digitsOnly(input[cd.start..cd.end], &normalized);
+                    const key = digitsOnly(original, &normalized);
                     const id = try self.intern(&self.card_map, &self.card_count, key);
                     try writePlaceholder(&out, dest_allocator, "CARD", id);
+                    try self.recordOriginal("CARD", id, original);
                     i = cd.end;
                     continue;
                 }
             }
             if (self.config.redact_phone) {
                 if (matchPhone(input, i)) |ph| {
+                    const original = input[ph.start..ph.end];
                     var normalized: [32]u8 = undefined;
-                    const key = digitsOnly(input[ph.start..ph.end], &normalized);
+                    const key = digitsOnly(original, &normalized);
                     const id = try self.intern(&self.phone_map, &self.phone_count, key);
                     try writePlaceholder(&out, dest_allocator, "PHONE", id);
+                    try self.recordOriginal("PHONE", id, original);
                     i = ph.end;
                     continue;
                 }
@@ -151,8 +179,10 @@ pub const Redactor = struct {
             if (self.config.redact_id) {
                 if (matchAnchoredId(input, i)) |idm| {
                     try out.appendSlice(dest_allocator, input[i..idm.value_start]);
-                    const id = try self.intern(&self.id_map, &self.id_count, input[idm.value_start..idm.value_end]);
+                    const original = input[idm.value_start..idm.value_end];
+                    const id = try self.intern(&self.id_map, &self.id_count, original);
                     try writePlaceholder(&out, dest_allocator, "ID", id);
+                    try self.recordOriginal("ID", id, original);
                     i = idm.value_end;
                     continue;
                 }
@@ -195,6 +225,59 @@ pub const Redactor = struct {
         counter.* = new_id;
         return new_id;
     }
+
+    /// Cache the original PII slice under "[KIND_<id>]" so unredact() can
+    /// restore it. No-op when `config.record_originals` is false. Idempotent —
+    /// once an id is recorded, subsequent calls for the same id are skipped
+    /// (intern() guarantees the same fingerprint maps to the same id, so the
+    /// original is identical anyway).
+    fn recordOriginal(self: *Redactor, kind: []const u8, id: u32, original: []const u8) !void {
+        if (!self.config.record_originals) return;
+
+        var key_buf: [32]u8 = undefined;
+        const key_slice = try std.fmt.bufPrint(&key_buf, "[{s}_{d}]", .{ kind, id });
+        if (self.placeholder_to_original.get(key_slice)) |_| return;
+
+        const key_dup = try self.allocator.dupe(u8, key_slice);
+        errdefer self.allocator.free(key_dup);
+        const value_dup = try self.allocator.dupe(u8, original);
+        errdefer self.allocator.free(value_dup);
+        try self.placeholder_to_original.put(key_dup, value_dup);
+    }
+
+    /// Replace `[EMAIL_N]` / `[PHONE_N]` / `[CARD_N]` / `[ID_N]` / `[TOKEN_N]`
+    /// occurrences in `input` with the originals captured during prior
+    /// redact() calls. Unknown placeholders pass through verbatim. Returns a
+    /// slice owned by `dest_allocator`. Safe when `record_originals` was off
+    /// during redaction — every placeholder will be unknown and preserved.
+    pub fn unredact(self: *Redactor, dest_allocator: std.mem.Allocator, input: []const u8) ![]u8 {
+        if (std.mem.indexOfScalar(u8, input, '[') == null) {
+            return dest_allocator.dupe(u8, input);
+        }
+
+        var out: std.ArrayListUnmanaged(u8) = .empty;
+        errdefer out.deinit(dest_allocator);
+
+        var i: usize = 0;
+        while (i < input.len) {
+            if (input[i] == '[') {
+                if (matchPlaceholderEnd(input, i)) |end| {
+                    const key = input[i..end];
+                    if (self.placeholder_to_original.get(key)) |original| {
+                        try out.appendSlice(dest_allocator, original);
+                    } else {
+                        try out.appendSlice(dest_allocator, key);
+                    }
+                    i = end;
+                    continue;
+                }
+            }
+            try out.append(dest_allocator, input[i]);
+            i += 1;
+        }
+
+        return try out.toOwnedSlice(dest_allocator);
+    }
 };
 
 fn freeKeys(map: *std.StringHashMap(u32), allocator: std.mem.Allocator) void {
@@ -207,6 +290,49 @@ fn freeKeys(map: *std.StringHashMap(u32), allocator: std.mem.Allocator) void {
 fn clearMap(map: *std.StringHashMap(u32), allocator: std.mem.Allocator) void {
     freeKeys(map, allocator);
     map.clearRetainingCapacity();
+}
+
+fn freeOriginalsMap(map: *std.StringHashMap([]u8), allocator: std.mem.Allocator) void {
+    var it = map.iterator();
+    while (it.next()) |entry| {
+        allocator.free(entry.key_ptr.*);
+        allocator.free(entry.value_ptr.*);
+    }
+}
+
+fn clearOriginalsMap(map: *std.StringHashMap([]u8), allocator: std.mem.Allocator) void {
+    freeOriginalsMap(map, allocator);
+    map.clearRetainingCapacity();
+}
+
+/// If `input[pos..]` starts with `[KIND_DIGITS]` where KIND ∈
+/// {EMAIL, PHONE, CARD, ID, TOKEN}, return the exclusive end index.
+/// Case-sensitive — the placeholders we generate are uppercase.
+fn matchPlaceholderEnd(input: []const u8, pos: usize) ?usize {
+    if (pos >= input.len or input[pos] != '[') return null;
+    var i = pos + 1;
+
+    const kinds = [_][]const u8{ "EMAIL", "PHONE", "CARD", "TOKEN", "ID" };
+    var matched_len: usize = 0;
+    for (kinds) |k| {
+        if (i + k.len > input.len) continue;
+        if (std.mem.eql(u8, input[i .. i + k.len], k)) {
+            matched_len = k.len;
+            break;
+        }
+    }
+    if (matched_len == 0) return null;
+    i += matched_len;
+
+    if (i >= input.len or input[i] != '_') return null;
+    i += 1;
+
+    const digits_start = i;
+    while (i < input.len and std.ascii.isDigit(input[i])) i += 1;
+    if (i == digits_start) return null;
+
+    if (i >= input.len or input[i] != ']') return null;
+    return i + 1;
 }
 
 fn writePlaceholder(out: *std.ArrayListUnmanaged(u8), allocator: std.mem.Allocator, kind: []const u8, id: u32) !void {
@@ -839,4 +965,119 @@ test "luhnValid rejects invalid sequences" {
     try std.testing.expect(!luhnValid("1234567890123456"));
     try std.testing.expect(!luhnValid("0000000000000001"));
     try std.testing.expect(!luhnValid(""));
+}
+
+test "unredact: empty input returns empty" {
+    const allocator = std.testing.allocator;
+    var r = Redactor.init(allocator, .{ .record_originals = true });
+    defer r.deinit();
+    const out = try r.unredact(allocator, "");
+    defer allocator.free(out);
+    try std.testing.expectEqualStrings("", out);
+}
+
+test "unredact: passthrough when no placeholders" {
+    const allocator = std.testing.allocator;
+    var r = Redactor.init(allocator, .{ .record_originals = true });
+    defer r.deinit();
+    const out = try r.unredact(allocator, "no placeholders here, just text 123");
+    defer allocator.free(out);
+    try std.testing.expectEqualStrings("no placeholders here, just text 123", out);
+}
+
+test "unredact: replaces single known email placeholder" {
+    const allocator = std.testing.allocator;
+    var r = Redactor.init(allocator, .{ .record_originals = true });
+    defer r.deinit();
+    const redacted = try r.redact(allocator, "ping alice@acme.com today");
+    defer allocator.free(redacted);
+    try std.testing.expectEqualStrings("ping [EMAIL_1] today", redacted);
+
+    const restored = try r.unredact(allocator, redacted);
+    defer allocator.free(restored);
+    try std.testing.expectEqualStrings("ping alice@acme.com today", restored);
+}
+
+test "unredact: replaces multiple mixed-kind placeholders" {
+    const allocator = std.testing.allocator;
+    var r = Redactor.init(allocator, .{ .record_originals = true });
+    defer r.deinit();
+    const redacted = try r.redact(allocator, "alice@acme.com / +7 905 123-45-67 / 4111111111111111");
+    defer allocator.free(redacted);
+
+    const restored = try r.unredact(allocator, redacted);
+    defer allocator.free(restored);
+    try std.testing.expectEqualStrings("alice@acme.com / +7 905 123-45-67 / 4111111111111111", restored);
+}
+
+test "unredact: passes unknown placeholder verbatim" {
+    const allocator = std.testing.allocator;
+    var r = Redactor.init(allocator, .{ .record_originals = true });
+    defer r.deinit();
+    const out = try r.unredact(allocator, "send to [EMAIL_99] now");
+    defer allocator.free(out);
+    try std.testing.expectEqualStrings("send to [EMAIL_99] now", out);
+}
+
+test "unredact: ignores malformed bracket text" {
+    const allocator = std.testing.allocator;
+    var r = Redactor.init(allocator, .{ .record_originals = true });
+    defer r.deinit();
+    const out = try r.unredact(allocator, "[email_1] [EMAIL_] [EMAIL_x] [oops] foo[bar");
+    defer allocator.free(out);
+    try std.testing.expectEqualStrings("[email_1] [EMAIL_] [EMAIL_x] [oops] foo[bar", out);
+}
+
+test "unredact: same placeholder appearing twice maps to same original" {
+    const allocator = std.testing.allocator;
+    var r = Redactor.init(allocator, .{ .record_originals = true });
+    defer r.deinit();
+    const redacted = try r.redact(allocator, "from alice@acme.com to alice@acme.com");
+    defer allocator.free(redacted);
+    try std.testing.expectEqualStrings("from [EMAIL_1] to [EMAIL_1]", redacted);
+
+    const restored = try r.unredact(allocator, redacted);
+    defer allocator.free(restored);
+    try std.testing.expectEqualStrings("from alice@acme.com to alice@acme.com", restored);
+}
+
+test "unredact: record_originals=false leaves placeholders intact" {
+    const allocator = std.testing.allocator;
+    var r = Redactor.init(allocator, .{}); // default record_originals=false
+    defer r.deinit();
+    const redacted = try r.redact(allocator, "ping alice@acme.com");
+    defer allocator.free(redacted);
+
+    const restored = try r.unredact(allocator, redacted);
+    defer allocator.free(restored);
+    // No reverse map populated, so unredact is a no-op (placeholder unknown).
+    try std.testing.expectEqualStrings("ping [EMAIL_1]", restored);
+}
+
+test "unredact: reset clears reverse map" {
+    const allocator = std.testing.allocator;
+    var r = Redactor.init(allocator, .{ .record_originals = true });
+    defer r.deinit();
+    const before = try r.redact(allocator, "ping alice@acme.com");
+    defer allocator.free(before);
+
+    r.reset();
+
+    const after = try r.unredact(allocator, before);
+    defer allocator.free(after);
+    // After reset the placeholder no longer resolves.
+    try std.testing.expectEqualStrings("ping [EMAIL_1]", after);
+}
+
+test "matchPlaceholderEnd: covers all kinds and rejects look-alikes" {
+    try std.testing.expectEqual(@as(?usize, 9), matchPlaceholderEnd("[EMAIL_1]", 0));
+    try std.testing.expectEqual(@as(?usize, 9), matchPlaceholderEnd("[PHONE_2]", 0));
+    try std.testing.expectEqual(@as(?usize, 8), matchPlaceholderEnd("[CARD_3]", 0));
+    try std.testing.expectEqual(@as(?usize, 6), matchPlaceholderEnd("[ID_7]", 0));
+    try std.testing.expectEqual(@as(?usize, 9), matchPlaceholderEnd("[TOKEN_4]", 0));
+    try std.testing.expectEqual(@as(?usize, null), matchPlaceholderEnd("[email_1]", 0));
+    try std.testing.expectEqual(@as(?usize, null), matchPlaceholderEnd("[EMAIL_]", 0));
+    try std.testing.expectEqual(@as(?usize, null), matchPlaceholderEnd("[EMAILX_1]", 0));
+    try std.testing.expectEqual(@as(?usize, null), matchPlaceholderEnd("[EMAIL_1", 0));
+    try std.testing.expectEqual(@as(?usize, null), matchPlaceholderEnd("EMAIL_1]", 0));
 }

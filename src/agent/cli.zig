@@ -40,6 +40,12 @@ const CliStreamCtx = struct {
     sink: streaming.Sink,
     emitted_text: bool = false,
     filter: streaming.TagFilter = undefined,
+    /// When true, the streaming sink swallows live tokens — they are buffered
+    /// inside the provider streaming layer and the full reply is printed once
+    /// at end-of-turn. Set when a Redactor is active so the final printed
+    /// text can be passed through `unredact()` and the user sees originals
+    /// instead of `[EMAIL_N]`/`[PHONE_N]`/etc.
+    suppress_live: bool = false,
 };
 
 const CliProviderContext = struct {
@@ -87,6 +93,12 @@ fn printPendingSubagentNotices(
 fn cliStreamSinkCallback(ctx_ptr: *anyopaque, event: streaming.Event) void {
     if (event.stage != .chunk or event.text.len == 0) return;
     const stream_ctx: *CliStreamCtx = @ptrCast(@alignCast(ctx_ptr));
+
+    // Redactor-aware: if live render is suppressed we also leave
+    // `emitted_text` false so shouldPrintTurnResponse() still fires the final
+    // print path, where the full reply is unredacted before display.
+    if (stream_ctx.suppress_live) return;
+
     stream_ctx.emitted_text = true;
 
     // In tests, stdout is used by Zig's test runner protocol (`--listen`).
@@ -550,6 +562,7 @@ pub fn run(allocator: std.mem.Allocator, args: []const [:0]const u8) !void {
         // Enable streaming if provider supports it
         var stream_ctx = CliStreamCtx{
             .sink = undefined,
+            .suppress_live = agent.redactor != null,
         };
         const raw_stream_sink = streaming.Sink{
             .callback = cliStreamSinkCallback,
@@ -587,7 +600,13 @@ pub fn run(allocator: std.mem.Allocator, args: []const [:0]const u8) !void {
         persistCliTurn(&agent, message, response);
 
         if (shouldPrintTurnResponse(supports_streaming, stream_ctx.emitted_text)) {
-            try w.print("{s}\n", .{response});
+            // unredact() always returns a fresh allocation when the redactor
+            // is on. Use an optional so cleanup logic doesn't depend on
+            // pointer identity.
+            const unredacted: ?[]u8 = if (agent.redactor) |r| try r.unredact(allocator, response) else null;
+            defer if (unredacted) |s| allocator.free(s);
+            const display: []const u8 = unredacted orelse response;
+            try w.print("{s}\n", .{display});
         } else {
             try w.print("\n", .{});
         }
@@ -664,6 +683,7 @@ pub fn run(allocator: std.mem.Allocator, args: []const [:0]const u8) !void {
     // Enable streaming if provider supports it
     var stream_ctx = CliStreamCtx{
         .sink = undefined,
+        .suppress_live = agent.redactor != null,
     };
     const raw_stream_sink = streaming.Sink{
         .callback = cliStreamSinkCallback,
@@ -744,7 +764,10 @@ pub fn run(allocator: std.mem.Allocator, args: []const [:0]const u8) !void {
         persistCliTurn(&agent, debounced_input.current, response);
 
         if (shouldPrintTurnResponse(supports_streaming, stream_ctx.emitted_text)) {
-            try w.print("\n{s}\n\n", .{response});
+            const unredacted: ?[]u8 = if (agent.redactor) |r| try r.unredact(allocator, response) else null;
+            defer if (unredacted) |s| allocator.free(s);
+            const display: []const u8 = unredacted orelse response;
+            try w.print("\n{s}\n\n", .{display});
         } else {
             try w.print("\n\n", .{});
         }
