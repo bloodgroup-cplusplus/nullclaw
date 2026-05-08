@@ -5,8 +5,12 @@
 //! deterministic numbered placeholders like `[EMAIL_1]`, `[CARD_2]`.
 //!
 //! Stateful: same value within or across `redact()` calls reuses the same id.
+//! Raw sensitive values are not stored in the long-lived maps; keys are
+//! per-redactor HMAC-SHA256 fingerprints so reset/deinit do not need to retain
+//! plaintext PII.
 
 const std = @import("std");
+const std_compat = @import("compat");
 
 pub const Config = struct {
     redact_email: bool = true,
@@ -24,6 +28,7 @@ pub const Redactor = struct {
     card_map: std.StringHashMap(u32),
     id_map: std.StringHashMap(u32),
     token_map: std.StringHashMap(u32),
+    fingerprint_key: [32]u8,
     email_count: u32,
     phone_count: u32,
     card_count: u32,
@@ -31,6 +36,8 @@ pub const Redactor = struct {
     token_count: u32,
 
     pub fn init(allocator: std.mem.Allocator, config: Config) Redactor {
+        var fingerprint_key: [32]u8 = undefined;
+        std_compat.crypto.random.bytes(&fingerprint_key);
         return .{
             .allocator = allocator,
             .config = config,
@@ -39,6 +46,7 @@ pub const Redactor = struct {
             .card_map = std.StringHashMap(u32).init(allocator),
             .id_map = std.StringHashMap(u32).init(allocator),
             .token_map = std.StringHashMap(u32).init(allocator),
+            .fingerprint_key = fingerprint_key,
             .email_count = 0,
             .phone_count = 0,
             .card_count = 0,
@@ -58,6 +66,20 @@ pub const Redactor = struct {
         self.card_map.deinit();
         self.id_map.deinit();
         self.token_map.deinit();
+    }
+
+    pub fn reset(self: *Redactor) void {
+        clearMap(&self.email_map, self.allocator);
+        clearMap(&self.phone_map, self.allocator);
+        clearMap(&self.card_map, self.allocator);
+        clearMap(&self.id_map, self.allocator);
+        clearMap(&self.token_map, self.allocator);
+        self.email_count = 0;
+        self.phone_count = 0;
+        self.card_count = 0;
+        self.id_count = 0;
+        self.token_count = 0;
+        std_compat.crypto.random.bytes(&self.fingerprint_key);
     }
 
     /// Redact PII / sensitive data from `input`. Returns slice owned by `dest_allocator`;
@@ -135,8 +157,13 @@ pub const Redactor = struct {
     }
 
     fn intern(self: *Redactor, map: *std.StringHashMap(u32), counter: *u32, value: []const u8) !u32 {
-        if (map.get(value)) |existing| return existing;
-        const key_dup = try self.allocator.dupe(u8, value);
+        const HmacSha256 = std.crypto.auth.hmac.sha2.HmacSha256;
+        var digest: [HmacSha256.mac_length]u8 = undefined;
+        HmacSha256.create(&digest, value, &self.fingerprint_key);
+        const fingerprint = std.fmt.bytesToHex(digest, .lower);
+
+        if (map.get(fingerprint[0..])) |existing| return existing;
+        const key_dup = try self.allocator.dupe(u8, fingerprint[0..]);
         errdefer self.allocator.free(key_dup);
         const new_id = counter.* + 1;
         try map.put(key_dup, new_id);
@@ -150,6 +177,11 @@ fn freeKeys(map: *std.StringHashMap(u32), allocator: std.mem.Allocator) void {
     while (it.next()) |entry| {
         allocator.free(entry.key_ptr.*);
     }
+}
+
+fn clearMap(map: *std.StringHashMap(u32), allocator: std.mem.Allocator) void {
+    freeKeys(map, allocator);
+    map.clearRetainingCapacity();
 }
 
 fn writePlaceholder(out: *std.ArrayListUnmanaged(u8), allocator: std.mem.Allocator, kind: []const u8, id: u32) !void {
@@ -220,6 +252,10 @@ fn matchKeyValueSecret(input: []const u8, pos: usize) ?KeyValueMatch {
         if (pos + kw.len >= input.len) continue;
         if (!eqlLowercase(input[pos .. pos + kw.len], kw)) continue;
         var sep_end = pos + kw.len;
+        if (sep_end < input.len and (input[sep_end] == '"' or input[sep_end] == '\'')) {
+            sep_end += 1;
+            while (sep_end < input.len and input[sep_end] == ' ') sep_end += 1;
+        }
         if (sep_end < input.len and (input[sep_end] == '=' or input[sep_end] == ':')) {
             sep_end += 1;
             while (sep_end < input.len and input[sep_end] == ' ') sep_end += 1;
@@ -232,7 +268,6 @@ fn matchKeyValueSecret(input: []const u8, pos: usize) ?KeyValueMatch {
             var value_end = value_start;
             if (quote != 0) {
                 while (value_end < input.len and input[value_end] != quote) value_end += 1;
-                if (value_end < input.len) value_end += 1;
             } else {
                 value_end = tokenEnd(input, value_start);
             }
@@ -284,7 +319,12 @@ fn matchEmail(input: []const u8, pos: usize) ?EmailMatch {
     const domain_start = i;
     while (i < input.len and isEmailDomainChar(input[i])) i += 1;
     if (i == domain_start) return null;
-    const domain = input[domain_start..i];
+    var domain_end = i;
+    while (domain_end > domain_start and (input[domain_end - 1] == '.' or input[domain_end - 1] == '-')) {
+        domain_end -= 1;
+    }
+    if (domain_end == domain_start) return null;
+    const domain = input[domain_start..domain_end];
     const last_dot = std.mem.lastIndexOfScalar(u8, domain, '.') orelse return null;
     if (last_dot == 0) return null;
     const tld = domain[last_dot + 1 ..];
@@ -292,7 +332,7 @@ fn matchEmail(input: []const u8, pos: usize) ?EmailMatch {
     for (tld) |c| {
         if (!std.ascii.isAlphabetic(c)) return null;
     }
-    return .{ .start = pos, .end = i };
+    return .{ .start = pos, .end = domain_end };
 }
 
 const CardMatch = struct { start: usize, end: usize };
@@ -423,6 +463,40 @@ test "Redactor email deterministic across calls" {
     defer allocator.free(b);
     try std.testing.expectEqualStrings("[EMAIL_1]", a);
     try std.testing.expectEqualStrings("[EMAIL_1]", b);
+}
+
+test "Redactor email before punctuation redacts only address" {
+    const allocator = std.testing.allocator;
+    var r = Redactor.init(allocator, .{});
+    defer r.deinit();
+    const out = try r.redact(allocator, "Mail me at user@example.com, or user@example.com.");
+    defer allocator.free(out);
+    try std.testing.expectEqualStrings("Mail me at [EMAIL_1], or [EMAIL_1].", out);
+}
+
+test "Redactor preserves quoted secret delimiters" {
+    const allocator = std.testing.allocator;
+    var r = Redactor.init(allocator, .{});
+    defer r.deinit();
+    const out = try r.redact(allocator, "{\"api_key\":\"sk-live-secret\",\"token\": 'abc123'}");
+    defer allocator.free(out);
+    try std.testing.expectEqualStrings("{\"api_key\":\"[TOKEN_1]\",\"token\": '[TOKEN_2]'}", out);
+}
+
+test "Redactor reset clears placeholder counters" {
+    const allocator = std.testing.allocator;
+    var r = Redactor.init(allocator, .{});
+    defer r.deinit();
+
+    const before = try r.redact(allocator, "a@b.co");
+    defer allocator.free(before);
+    try std.testing.expectEqualStrings("[EMAIL_1]", before);
+
+    r.reset();
+
+    const after = try r.redact(allocator, "x@y.zz");
+    defer allocator.free(after);
+    try std.testing.expectEqualStrings("[EMAIL_1]", after);
 }
 
 test "Redactor different emails get sequential ids" {

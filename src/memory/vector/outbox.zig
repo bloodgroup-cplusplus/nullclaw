@@ -17,7 +17,14 @@ const embeddings = @import("embeddings.zig");
 const key_codec = @import("key_codec.zig");
 const vector_store_mod = @import("store.zig");
 const circuit_breaker_mod = @import("circuit_breaker.zig");
+const redaction = @import("../../redaction.zig");
 const log = std.log.scoped(.outbox);
+
+fn redactForEmbedding(allocator: Allocator, content: []const u8) ![]u8 {
+    var r = redaction.Redactor.init(allocator, .{});
+    defer r.deinit();
+    return r.redact(allocator, content);
+}
 
 pub const VectorOutbox = struct {
     db: ?*c.sqlite3, // borrowed from SqliteMemory
@@ -178,7 +185,14 @@ pub const VectorOutbox = struct {
                     defer allocator.free(value.vector_key);
 
                     // Embed the content
-                    const embedding = embed_provider.embed(allocator, value.content) catch |err| {
+                    const safe_content = redactForEmbedding(allocator, value.content) catch |err| {
+                        self.recordItemFailure(item.id, @errorName(err)) catch {};
+                        if (breaker) |b| b.recordFailure();
+                        continue;
+                    };
+                    defer allocator.free(safe_content);
+
+                    const embedding = embed_provider.embed(allocator, safe_content) catch |err| {
                         self.recordItemFailure(item.id, @errorName(err)) catch {};
                         if (breaker) |b| b.recordFailure();
                         continue;

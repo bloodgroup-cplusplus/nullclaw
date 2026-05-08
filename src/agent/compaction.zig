@@ -268,11 +268,18 @@ fn buildCompactionTranscript(
     start: usize,
     end: usize,
     max_source_chars: u32,
+    redactor: ?*redaction.Redactor,
 ) ![]u8 {
     var buf: std.ArrayList(u8) = .empty;
     errdefer buf.deinit(allocator);
 
     for (history_items[start..end]) |*msg| {
+        const redacted_content = if (redactor) |r|
+            try r.redact(allocator, msg.content)
+        else
+            null;
+        defer if (redacted_content) |content| allocator.free(content);
+
         const role_str: []const u8 = switch (msg.role) {
             .system => "SYSTEM",
             .user => "USER",
@@ -281,8 +288,9 @@ fn buildCompactionTranscript(
         };
         try buf.appendSlice(allocator, role_str);
         try buf.appendSlice(allocator, ": ");
-        // Truncate very long messages in transcript
-        const content = if (msg.content.len > 500) util.truncateUtf8(msg.content, 500) else msg.content;
+        // Redact before truncation so boundary cuts cannot leave partial PII.
+        const source_content = redacted_content orelse msg.content;
+        const content = if (source_content.len > 500) util.truncateUtf8(source_content, 500) else source_content;
         try buf.appendSlice(allocator, content);
         try buf.append(allocator, '\n');
 
@@ -309,7 +317,7 @@ fn summarizeSlice(
     config: CompactionConfig,
     redactor: ?*redaction.Redactor,
 ) ![]u8 {
-    const transcript = try buildCompactionTranscript(allocator, history_items, start, end, config.max_source_chars);
+    const transcript = try buildCompactionTranscript(allocator, history_items, start, end, config.max_source_chars, redactor);
     defer allocator.free(transcript);
 
     const summarizer_system = "You are a conversation compaction engine. Summarize older chat history into concise context for future turns. Preserve: user preferences, commitments, decisions, unresolved tasks, key facts. Omit: filler, repeated chit-chat, verbose tool logs. Output plain text bullet points only.";
@@ -343,7 +351,7 @@ fn summarizeSlice(
         model_name,
         0.2,
     ) catch {
-        // Fallback: use a local truncation of the transcript
+        // Fallback: use a local truncation of the already-redacted transcript.
         const max_len = @min(transcript.len, config.max_summary_chars);
         return try allocator.dupe(u8, util.truncateUtf8(transcript, max_len));
     };
@@ -1062,7 +1070,7 @@ test "buildCompactionTranscript keeps UTF-8 valid when truncating long message c
         .{ .role = .user, .content = content },
     };
 
-    const transcript = try buildCompactionTranscript(allocator, &history, 0, history.len, 4_096);
+    const transcript = try buildCompactionTranscript(allocator, &history, 0, history.len, 4_096, null);
     defer allocator.free(transcript);
 
     try std.testing.expect(std.unicode.utf8ValidateSlice(transcript));
@@ -1161,4 +1169,57 @@ test "autoCompactHistory redacts PII before sending to summarizer" {
     // Regression guard: raw email must not have reached the summarizer prompt.
     try std.testing.expect(std.mem.indexOf(u8, captured, "user@example.com") == null);
     try std.testing.expect(std.mem.indexOf(u8, captured, "[EMAIL_1]") != null);
+}
+
+test "summarizeSlice fallback uses redacted transcript" {
+    const FailingSummaryProvider = struct {
+        fn chatWithSystem(_: *anyopaque, allocator: std.mem.Allocator, _: ?[]const u8, _: []const u8, _: []const u8, _: f64) anyerror![]const u8 {
+            return allocator.dupe(u8, "");
+        }
+
+        fn chat(_: *anyopaque, _: std.mem.Allocator, _: providers.ChatRequest, _: []const u8, _: f64) anyerror!providers.ChatResponse {
+            return error.SummaryUnavailable;
+        }
+
+        fn supportsNativeTools(_: *anyopaque) bool {
+            return false;
+        }
+
+        fn getName(_: *anyopaque) []const u8 {
+            return "failing-summary";
+        }
+
+        fn deinit(_: *anyopaque) void {}
+    };
+
+    const provider_vtable = Provider.VTable{
+        .chatWithSystem = FailingSummaryProvider.chatWithSystem,
+        .chat = FailingSummaryProvider.chat,
+        .supportsNativeTools = FailingSummaryProvider.supportsNativeTools,
+        .getName = FailingSummaryProvider.getName,
+        .deinit = FailingSummaryProvider.deinit,
+    };
+
+    const allocator = std.testing.allocator;
+    var provider_state: u8 = 0;
+    const provider = Provider{
+        .ptr = @ptrCast(&provider_state),
+        .vtable = &provider_vtable,
+    };
+
+    var redactor = redaction.Redactor.init(allocator, .{});
+    defer redactor.deinit();
+
+    const history = [_]OwnedMessage{
+        .{ .role = .user, .content = "contact user@example.com before fallback" },
+    };
+
+    const summary = try summarizeSlice(allocator, provider, "test-model", &history, 0, history.len, .{
+        .max_source_chars = 4_096,
+        .max_summary_chars = 512,
+    }, &redactor);
+    defer allocator.free(summary);
+
+    try std.testing.expect(std.mem.indexOf(u8, summary, "user@example.com") == null);
+    try std.testing.expect(std.mem.indexOf(u8, summary, "[EMAIL_1]") != null);
 }

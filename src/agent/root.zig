@@ -448,6 +448,21 @@ pub const Agent = struct {
         };
     }
 
+    fn redactOwnedForHistory(self: *Agent, owned: []const u8) ![]const u8 {
+        const r = self.redactor orelse return owned;
+        const redacted = r.redact(self.allocator, owned) catch |err| {
+            self.allocator.free(owned);
+            return err;
+        };
+        self.allocator.free(owned);
+        return redacted;
+    }
+
+    fn dupeForHistory(self: *Agent, content: []const u8) ![]const u8 {
+        if (self.redactor) |r| return r.redact(self.allocator, content);
+        return self.allocator.dupe(u8, content);
+    }
+
     fn drainPendingInjection(self: *Agent) !?[]u8 {
         if (self.drain_injection_cb) |drain_cb| {
             if (self.drain_injection_ctx) |drain_ctx| {
@@ -536,10 +551,11 @@ pub const Agent = struct {
             mem,
             effective_workspace_dir,
         ) catch null;
+        errdefer if (bootstrap_provider) |bp| bp.deinit();
 
         // DG-2: per-conversation PII redactor (default-on, can be disabled per agent profile).
         const redactor_ptr: ?*redaction.Redactor = blk: {
-            const enabled = if (profile) |p| p.enable_pii_redaction else true;
+            const enabled = if (profile) |p| p.enable_pii_redaction else cfg.agent.enable_pii_redaction;
             if (!enabled) break :blk null;
             const r = try allocator.create(redaction.Redactor);
             // Inner errdefer covers any future fallible op between alloc and break.
@@ -723,7 +739,7 @@ pub const Agent = struct {
         errdefer self.allocator.free(msg);
         try self.history.append(self.allocator, .{
             .role = .assistant,
-            .content = try self.allocator.dupe(u8, msg),
+            .content = try self.dupeForHistory(msg),
         });
         const complete_event = ObserverEvent{ .turn_complete = {} };
         self.observer.recordEvent(&complete_event);
@@ -1836,6 +1852,12 @@ pub const Agent = struct {
             }
             break :blk turn_input.llm_user_message orelse user_message;
         };
+        var safe_user_message_owned: ?[]u8 = null;
+        defer if (safe_user_message_owned) |msg| self.allocator.free(msg);
+        const safe_user_message = if (self.redactor) |r| blk: {
+            safe_user_message_owned = try r.redact(self.allocator, effective_user_message);
+            break :blk safe_user_message_owned.?;
+        } else effective_user_message;
 
         const turn_route_selection = self.routeSelectionForTurn(effective_user_message);
         if (turn_route_selection) |selection| {
@@ -1967,10 +1989,10 @@ pub const Agent = struct {
                 const save_key = std.fmt.allocPrint(self.allocator, "autosave_user_{d}", .{ts}) catch null;
                 if (save_key) |key| {
                     defer self.allocator.free(key);
-                    if (mem.store(key, effective_user_message, .conversation, self.memory_session_id)) |_| {
+                    if (mem.store(key, safe_user_message, .conversation, self.memory_session_id)) |_| {
                         // Vector sync after auto-save
                         if (self.mem_rt) |rt| {
-                            rt.syncVectorAfterStore(self.allocator, key, effective_user_message, self.memory_session_id);
+                            rt.syncVectorAfterStore(self.allocator, key, safe_user_message, self.memory_session_id);
                         }
                     } else |_| {}
                 }
@@ -1979,10 +2001,11 @@ pub const Agent = struct {
 
         // Enrich message with memory context (always returns owned slice; ownership → history)
         // Uses retrieval pipeline (hybrid search, RRF, temporal decay, MMR) when MemoryRuntime is available.
-        const enriched = if (self.mem) |mem|
-            try memory_loader.enrichMessageWithRuntime(self.allocator, mem, self.mem_rt, effective_user_message, self.memory_session_id)
+        const enriched_raw = if (self.mem) |mem|
+            try memory_loader.enrichMessageWithRuntime(self.allocator, mem, self.mem_rt, safe_user_message, self.memory_session_id)
         else
-            try self.allocator.dupe(u8, effective_user_message);
+            try self.allocator.dupe(u8, safe_user_message);
+        const enriched = try self.redactOwnedForHistory(enriched_raw);
 
         // Keep the user message retained even if provider/tool steps fail.
         try self.appendOwnedHistoryMessage(.{ .role = .user, .content = enriched });
@@ -1994,10 +2017,10 @@ pub const Agent = struct {
                 self.history.items[0].content
             else
                 null;
-            const key_hex = cache.ResponseCache.cacheKeyHex(&key_buf, turn_model_name, system_prompt, effective_user_message);
+            const key_hex = cache.ResponseCache.cacheKeyHex(&key_buf, turn_model_name, system_prompt, safe_user_message);
             if (rc.get(self.allocator, key_hex) catch null) |cached_response| {
                 errdefer self.allocator.free(cached_response);
-                const history_copy = try self.allocator.dupe(u8, cached_response);
+                const history_copy = try self.dupeForHistory(cached_response);
                 errdefer self.allocator.free(history_copy);
                 try self.history.append(self.allocator, .{
                     .role = .assistant,
@@ -2030,7 +2053,8 @@ pub const Agent = struct {
 
             // Drain any mid-turn injection at each tool boundary.
             if (try self.drainPendingInjection()) |injected| {
-                try self.appendOwnedHistoryMessage(.{ .role = .user, .content = injected });
+                const safe_injected = try self.redactOwnedForHistory(injected);
+                try self.appendOwnedHistoryMessage(.{ .role = .user, .content = safe_injected });
             }
 
             _ = iter_arena.reset(.retain_capacity);
@@ -2422,7 +2446,7 @@ pub const Agent = struct {
                     iteration + 1 < self.max_tool_iterations and
                     shouldForceActionFollowThrough(display_text))
                 {
-                    try self.appendOwnedHistoryMessage(.{ .role = .assistant, .content = try self.allocator.dupe(u8, display_text) });
+                    try self.appendOwnedHistoryMessage(.{ .role = .assistant, .content = try self.dupeForHistory(display_text) });
                     try self.appendOwnedHistoryMessage(.{ .role = .user, .content = try self.allocator.dupe(u8, "SYSTEM: You just promised to take action now (for example: \"I'll try/check now\"). " ++
                         "Do it in this turn by issuing the appropriate tool call(s). " ++
                         "If no tool can perform it, respond with a clear limitation now and do not promise another future attempt.") });
@@ -2439,9 +2463,10 @@ pub const Agent = struct {
                     if (try self.drainPendingInjection()) |injected| {
                         try self.appendOwnedHistoryMessage(.{
                             .role = .assistant,
-                            .content = try self.allocator.dupe(u8, display_text),
+                            .content = try self.dupeForHistory(display_text),
                         });
-                        try self.appendOwnedHistoryMessage(.{ .role = .user, .content = injected });
+                        const safe_injected = try self.redactOwnedForHistory(injected);
+                        try self.appendOwnedHistoryMessage(.{ .role = .user, .content = safe_injected });
                         self.trimHistory();
                         self.freeResponseFields(&response);
                         injection_followups += 1;
@@ -2462,7 +2487,7 @@ pub const Agent = struct {
                 // Dupe from display_text directly (not from final_text) to avoid double-dupe
                 try self.history.append(self.allocator, .{
                     .role = .assistant,
-                    .content = try self.allocator.dupe(u8, display_text),
+                    .content = try self.dupeForHistory(display_text),
                 });
 
                 // Auto-compaction before hard trimming to preserve context
@@ -2478,16 +2503,22 @@ pub const Agent = struct {
                             while (end > 0 and base_text[end] & 0xC0 == 0x80) end -= 1;
                             break :blk base_text[0..end];
                         } else base_text;
+                        const safe_summary = if (self.redactor) |r|
+                            r.redact(arena, summary) catch null
+                        else
+                            summary;
                         const ts: u128 = @bitCast(std_compat.time.nanoTimestamp());
                         const save_key = std.fmt.allocPrint(self.allocator, "autosave_assistant_{d}", .{ts}) catch null;
                         if (save_key) |key| {
                             defer self.allocator.free(key);
-                            if (mem.store(key, summary, .conversation, self.memory_session_id)) |_| {
-                                // Vector sync after auto-save
-                                if (self.mem_rt) |rt| {
-                                    rt.syncVectorAfterStore(self.allocator, key, summary, self.memory_session_id);
-                                }
-                            } else |_| {}
+                            if (safe_summary) |content| {
+                                if (mem.store(key, content, .conversation, self.memory_session_id)) |_| {
+                                    // Vector sync after auto-save
+                                    if (self.mem_rt) |rt| {
+                                        rt.syncVectorAfterStore(self.allocator, key, content, self.memory_session_id);
+                                    }
+                                } else |_| {}
+                            }
                         }
                     }
                 }
@@ -2512,7 +2543,7 @@ pub const Agent = struct {
                         self.history.items[0].content
                     else
                         null;
-                    const store_key_hex = cache.ResponseCache.cacheKeyHex(&store_key_buf, turn_model_name, sys_prompt, effective_user_message);
+                    const store_key_hex = cache.ResponseCache.cacheKeyHex(&store_key_buf, turn_model_name, sys_prompt, safe_user_message);
                     const token_count: u32 = @intCast(@min(self.last_turn_usage.total_tokens, std.math.maxInt(u32)));
                     rc.put(self.allocator, store_key_hex, turn_model_name, final_text, token_count) catch {};
                 }
@@ -2541,7 +2572,8 @@ pub const Agent = struct {
             } else try self.allocator.dupe(u8, assistant_history_content);
 
             // Once appended, history owns the buffer.
-            try self.appendOwnedHistoryMessage(.{ .role = .assistant, .content = assistant_content });
+            const safe_assistant_content = try self.redactOwnedForHistory(assistant_content);
+            try self.appendOwnedHistoryMessage(.{ .role = .assistant, .content = safe_assistant_content });
 
             // Execute each tool call
             var results_buf: std.ArrayListUnmanaged(ToolExecutionResult) = .empty;
@@ -2612,11 +2644,12 @@ pub const Agent = struct {
                     null;
                 const tool_detail = if (self.log_llm_io) blk: {
                     const scrubbed_output = providers.scrubToolOutput(arena, result.output) catch result.output;
-                    break :blk toolResultObserverDetail(&tool_detail_buf, scrubbed_output);
-                } else if (!result.success)
-                    result.output
-                else
-                    null;
+                    const safe_output = if (self.redactor) |r| r.redact(arena, scrubbed_output) catch scrubbed_output else scrubbed_output;
+                    break :blk toolResultObserverDetail(&tool_detail_buf, safe_output);
+                } else if (!result.success) blk: {
+                    const scrubbed_output = providers.scrubToolOutput(arena, result.output) catch result.output;
+                    break :blk if (self.redactor) |r| r.redact(arena, scrubbed_output) catch scrubbed_output else scrubbed_output;
+                } else null;
                 const tool_event = ObserverEvent{ .tool_call = .{
                     .tool = call.name,
                     .duration_ms = tool_duration,
@@ -2632,12 +2665,13 @@ pub const Agent = struct {
             // Format tool results, scrub credentials, add reflection prompt, and add to history
             const formatted_results = try dispatcher.formatToolResults(arena, results_buf.items);
             const scrubbed_results = try providers.scrubToolOutput(arena, formatted_results);
+            const redacted_results = if (self.redactor) |r| try r.redact(arena, scrubbed_results) else scrubbed_results;
             const with_reflection = try std.fmt.allocPrint(
                 arena,
                 "{s}\n\nReflect on the tool results above and decide your next steps. " ++
                     "If a tool failed due to policy/permissions, do not repeat the same blocked call; explain the limitation and choose a different available tool or ask the user for permission/config change. " ++
                     "If a tool failed due to a transient issue (timeout/network/rate-limit), proactively retry up to 2 times with adjusted parameters before giving up.",
-                .{scrubbed_results},
+                .{redacted_results},
             );
             try self.history.append(self.allocator, .{
                 .role = .user,
@@ -2744,7 +2778,7 @@ pub const Agent = struct {
         // Store in history (dupe the raw summary, not the prefixed version)
         try self.history.append(self.allocator, .{
             .role = .assistant,
-            .content = try self.allocator.dupe(u8, summary_text),
+            .content = try self.dupeForHistory(summary_text),
         });
 
         // Compact/trim history so the next turn doesn't start with bloated context
@@ -3489,7 +3523,11 @@ pub const Agent = struct {
         for (parts, 0..) |p, i| {
             out[i] = switch (p) {
                 .text => |t| ContentPart{ .text = try redactor.redact(arena, t) },
-                .image_url, .image_base64 => p,
+                .image_url => |img| ContentPart{ .image_url = .{
+                    .url = try redactor.redact(arena, img.url),
+                    .detail = img.detail,
+                } },
+                .image_base64 => p,
             };
         }
         return out;
@@ -3576,6 +3614,7 @@ pub const Agent = struct {
         self.system_prompt_has_conversation_context = false;
         self.system_prompt_conversation_context_fingerprint = null;
         self.workspace_prompt_fingerprint = null;
+        if (self.redactor) |r| r.reset();
     }
 
     /// Get total tokens used.
@@ -4363,6 +4402,9 @@ const RecordingObserver = struct {
     last_llm_response_total_tokens: ?u32 = null,
     llm_request_message_counts: [8]usize = [_]usize{0} ** 8,
     llm_request_message_counts_len: usize = 0,
+    tool_call_count: usize = 0,
+    last_tool_detail: [512]u8 = undefined,
+    last_tool_detail_len: usize = 0,
 
     const vtable = Observer.VTable{
         .record_event = recordEvent,
@@ -4401,6 +4443,14 @@ const RecordingObserver = struct {
             },
             .turn_complete => {
                 self.turn_complete_count += 1;
+            },
+            .tool_call => |e| {
+                self.tool_call_count += 1;
+                if (e.detail) |detail| {
+                    const len = @min(detail.len, self.last_tool_detail.len);
+                    @memcpy(self.last_tool_detail[0..len], detail[0..len]);
+                    self.last_tool_detail_len = len;
+                }
             },
             else => {},
         }
@@ -10474,6 +10524,152 @@ test "Agent: redactor enabled scrubs email before provider" {
     try std.testing.expect(std.mem.indexOf(u8, got, "user@example.com") == null);
 }
 
+test "Agent: redactor stores redacted user content in local history" {
+    const allocator = std.testing.allocator;
+    var state = RedactCaptureProvider{ .capture_alloc = allocator };
+    defer if (state.captured_user) |c| allocator.free(c);
+    const provider = Provider{ .ptr = @ptrCast(&state), .vtable = &dg2_capture_vtable };
+
+    var cfg = dg2BaseConfig(allocator);
+    var noop = observability.NoopObserver{};
+    var agent = try Agent.fromConfigWithProfile(allocator, &cfg, provider, &.{}, null, noop.observer(), null);
+    defer agent.deinit();
+
+    const response = try agent.turn("contact me at user@example.com please");
+    defer allocator.free(response);
+
+    var saw_redacted_user = false;
+    for (agent.history.items) |msg| {
+        if (msg.role != .user) continue;
+        try std.testing.expect(std.mem.indexOf(u8, msg.content, "user@example.com") == null);
+        if (std.mem.indexOf(u8, msg.content, "[EMAIL_1]") != null) saw_redacted_user = true;
+    }
+    try std.testing.expect(saw_redacted_user);
+}
+
+test "Agent: redactor stores redacted autosave memory" {
+    const allocator = std.testing.allocator;
+    var state = RedactCaptureProvider{ .capture_alloc = allocator };
+    defer if (state.captured_user) |c| allocator.free(c);
+    const provider = Provider{ .ptr = @ptrCast(&state), .vtable = &dg2_capture_vtable };
+
+    var mem_backend = memory_mod.memory_lru.InMemoryLruMemory.init(allocator, 16);
+    defer mem_backend.deinit();
+    const mem = mem_backend.memory();
+
+    var cfg = dg2BaseConfig(allocator);
+    cfg.memory.auto_save = true;
+
+    var noop = observability.NoopObserver{};
+    var agent = try Agent.fromConfigWithProfile(allocator, &cfg, provider, &.{}, mem, noop.observer(), null);
+    defer agent.deinit();
+
+    const response = try agent.turn("remember user@example.com for the test");
+    defer allocator.free(response);
+
+    const entries = try mem.list(allocator, .conversation, null);
+    defer memory_mod.freeEntries(allocator, entries);
+
+    var saw_redacted_autosave = false;
+    for (entries) |entry| {
+        try std.testing.expect(std.mem.indexOf(u8, entry.content, "user@example.com") == null);
+        if (std.mem.indexOf(u8, entry.content, "[EMAIL_1]") != null) saw_redacted_autosave = true;
+    }
+    try std.testing.expect(saw_redacted_autosave);
+}
+
+test "Agent: redactor scrubs failed tool output in observer detail" {
+    const PiiFailureTool = struct {
+        const Self = @This();
+        pub const tool_name = "pii_failure_probe";
+        pub const tool_description = "Returns a failing output with PII for redaction regression testing.";
+        pub const tool_params = "{\"type\":\"object\",\"properties\":{},\"additionalProperties\":false}";
+        pub const vtable = tools_mod.ToolVTable(Self);
+
+        fn tool(self: *Self) Tool {
+            return .{ .ptr = @ptrCast(self), .vtable = &vtable };
+        }
+
+        pub fn execute(_: *Self, allocator: std.mem.Allocator, _: tools_mod.JsonObjectMap) !tools_mod.ToolResult {
+            return .{
+                .success = false,
+                .output = try allocator.dupe(u8, "lookup failed for user@example.com"),
+            };
+        }
+    };
+
+    const ToolThenFinalProvider = struct {
+        const Self = @This();
+        call_count: usize = 0,
+
+        fn chatWithSystem(_: *anyopaque, allocator: std.mem.Allocator, _: ?[]const u8, _: []const u8, _: []const u8, _: f64) anyerror![]const u8 {
+            return allocator.dupe(u8, "");
+        }
+
+        fn chat(ptr: *anyopaque, allocator: std.mem.Allocator, _: providers.ChatRequest, model: []const u8, _: f64) anyerror!providers.ChatResponse {
+            const self: *Self = @ptrCast(@alignCast(ptr));
+            self.call_count += 1;
+            if (self.call_count == 1) {
+                const tool_calls = try allocator.alloc(providers.ToolCall, 1);
+                tool_calls[0] = .{
+                    .id = try allocator.dupe(u8, "call-pii-failure"),
+                    .name = try allocator.dupe(u8, "pii_failure_probe"),
+                    .arguments = try allocator.dupe(u8, "{}"),
+                };
+                return .{
+                    .content = try allocator.dupe(u8, "checking"),
+                    .tool_calls = tool_calls,
+                    .usage = .{},
+                    .model = try allocator.dupe(u8, model),
+                };
+            }
+            return .{
+                .content = try allocator.dupe(u8, "done"),
+                .tool_calls = &.{},
+                .usage = .{},
+                .model = try allocator.dupe(u8, model),
+            };
+        }
+
+        fn supportsNativeTools(_: *anyopaque) bool {
+            return true;
+        }
+
+        fn getName(_: *anyopaque) []const u8 {
+            return "tool-then-final";
+        }
+
+        fn deinitFn(_: *anyopaque) void {}
+    };
+
+    const provider_vtable = Provider.VTable{
+        .chatWithSystem = ToolThenFinalProvider.chatWithSystem,
+        .chat = ToolThenFinalProvider.chat,
+        .supportsNativeTools = ToolThenFinalProvider.supportsNativeTools,
+        .getName = ToolThenFinalProvider.getName,
+        .deinit = ToolThenFinalProvider.deinitFn,
+    };
+
+    const allocator = std.testing.allocator;
+    var provider_state = ToolThenFinalProvider{};
+    const provider = Provider{ .ptr = @ptrCast(&provider_state), .vtable = &provider_vtable };
+    var tool_state = PiiFailureTool{};
+    const tool = tool_state.tool();
+
+    var cfg = dg2BaseConfig(allocator);
+    var observer = RecordingObserver{};
+    var agent = try Agent.fromConfigWithProfile(allocator, &cfg, provider, &.{tool}, null, observer.observer(), null);
+    defer agent.deinit();
+
+    const response = try agent.turn("run the failure probe");
+    defer allocator.free(response);
+
+    try std.testing.expect(observer.tool_call_count >= 1);
+    const detail = observer.last_tool_detail[0..observer.last_tool_detail_len];
+    try std.testing.expect(std.mem.indexOf(u8, detail, "user@example.com") == null);
+    try std.testing.expect(std.mem.indexOf(u8, detail, "[EMAIL_1]") != null);
+}
+
 test "Agent: redactor disabled passes content through verbatim" {
     const allocator = std.testing.allocator;
     var state = RedactCaptureProvider{ .capture_alloc = allocator };
@@ -10500,6 +10696,30 @@ test "Agent: redactor disabled passes content through verbatim" {
     try std.testing.expect(state.captured_user != null);
     const got = state.captured_user.?;
     // When disabled, original content must reach the provider untouched.
+    try std.testing.expect(std.mem.indexOf(u8, got, "user@example.com") != null);
+    try std.testing.expect(std.mem.indexOf(u8, got, "[EMAIL_1]") == null);
+}
+
+test "Agent: root redactor can be disabled from agent config" {
+    const allocator = std.testing.allocator;
+    var state = RedactCaptureProvider{ .capture_alloc = allocator };
+    defer if (state.captured_user) |c| allocator.free(c);
+    const provider = Provider{ .ptr = @ptrCast(&state), .vtable = &dg2_capture_vtable };
+
+    var cfg = dg2BaseConfig(allocator);
+    cfg.agent.enable_pii_redaction = false;
+
+    var noop = observability.NoopObserver{};
+    var agent = try Agent.fromConfigWithProfile(allocator, &cfg, provider, &.{}, null, noop.observer(), null);
+    defer agent.deinit();
+
+    try std.testing.expect(agent.redactor == null);
+
+    const response = try agent.turn("contact me at user@example.com please");
+    defer allocator.free(response);
+
+    try std.testing.expect(state.captured_user != null);
+    const got = state.captured_user.?;
     try std.testing.expect(std.mem.indexOf(u8, got, "user@example.com") != null);
     try std.testing.expect(std.mem.indexOf(u8, got, "[EMAIL_1]") == null);
 }
@@ -10538,8 +10758,38 @@ test "Agent: redactor preserves cross-turn placeholder ids" {
     try std.testing.expect(std.mem.indexOf(u8, got2, "[EMAIL_2]") == null);
 }
 
-test "Agent.redactMessagesForProvider preserves multimodal image parts" {
-    // Direct unit test on the helper: text content_parts get redacted, image parts pass through.
+test "Agent: clearHistory resets redactor placeholder state" {
+    const allocator = std.testing.allocator;
+    var state = RedactCaptureProvider{ .capture_alloc = allocator };
+    defer if (state.captured_user) |c| allocator.free(c);
+    const provider = Provider{ .ptr = @ptrCast(&state), .vtable = &dg2_capture_vtable };
+
+    var cfg = dg2BaseConfig(allocator);
+    const profile = config_types.NamedAgentConfig{
+        .name = "redact-reset",
+        .provider = "openrouter",
+        .model = "openrouter/test-model",
+        .enable_pii_redaction = true,
+    };
+
+    var noop = observability.NoopObserver{};
+    var agent = try Agent.fromConfigWithProfile(allocator, &cfg, provider, &.{}, null, noop.observer(), profile);
+    defer agent.deinit();
+
+    const r1 = try agent.turn("first ping a@b.co");
+    defer allocator.free(r1);
+    try std.testing.expect(std.mem.indexOf(u8, state.captured_user.?, "[EMAIL_1]") != null);
+
+    agent.clearHistory();
+
+    const r2 = try agent.turn("new chat x@y.zz");
+    defer allocator.free(r2);
+    try std.testing.expect(std.mem.indexOf(u8, state.captured_user.?, "[EMAIL_1]") != null);
+    try std.testing.expect(std.mem.indexOf(u8, state.captured_user.?, "[EMAIL_2]") == null);
+}
+
+test "Agent.redactMessagesForProvider redacts multimodal text and image URLs" {
+    // Direct unit test on the helper: text content_parts and image URLs get redacted.
     const allocator = std.testing.allocator;
     var arena = std.heap.ArenaAllocator.init(allocator);
     defer arena.deinit();
@@ -10549,7 +10799,7 @@ test "Agent.redactMessagesForProvider preserves multimodal image parts" {
 
     const parts = [_]ContentPart{
         ContentPart{ .text = "see a@b.co for context" },
-        ContentPart{ .image_url = .{ .url = "https://example.com/x.png" } },
+        ContentPart{ .image_url = .{ .url = "https://example.com/x.png?token=abc123&email=user@example.com" } },
     };
     const messages = [_]ChatMessage{
         ChatMessage{
@@ -10571,9 +10821,12 @@ test "Agent.redactMessagesForProvider preserves multimodal image parts" {
     try std.testing.expect(std.mem.indexOf(u8, out_parts[0].text, "[EMAIL_1]") != null);
     try std.testing.expect(std.mem.indexOf(u8, out_parts[0].text, "a@b.co") == null);
 
-    // Image part preserved verbatim (URL and detail untouched).
+    // Image URL query/path content is redacted before provider handoff.
     try std.testing.expect(std.meta.activeTag(out_parts[1]) == .image_url);
-    try std.testing.expectEqualStrings("https://example.com/x.png", out_parts[1].image_url.url);
+    try std.testing.expect(std.mem.indexOf(u8, out_parts[1].image_url.url, "abc123") == null);
+    try std.testing.expect(std.mem.indexOf(u8, out_parts[1].image_url.url, "user@example.com") == null);
+    try std.testing.expect(std.mem.indexOf(u8, out_parts[1].image_url.url, "[TOKEN_1]") != null);
+    try std.testing.expect(std.mem.indexOf(u8, out_parts[1].image_url.url, "[EMAIL_2]") != null);
 }
 
 // ---- DG-2 Test 6: iteration-exhausted summary path ----

@@ -20,6 +20,8 @@ result
 .worktrees
 config.signal.json
 nullclaw-codebase*.md
+nullclaw-pr-review*.md
+nullclaw-review-prompt*.md
 
 # IDE configurations
 .idea/

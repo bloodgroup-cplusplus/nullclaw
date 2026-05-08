@@ -1868,10 +1868,22 @@ pub const SessionManager = struct {
 
         // Persist messages via session store
         if (session.agent.session_store) |store| {
+            const persisted_content = if (session.agent.redactor) |r|
+                r.redact(self.allocator, content) catch null
+            else
+                null;
+            defer if (persisted_content) |text| self.allocator.free(text);
+
+            const persisted_response = if (session.agent.redactor) |r|
+                r.redact(self.allocator, response) catch null
+            else
+                null;
+            defer if (persisted_response) |text| self.allocator.free(text);
+
             turn_persistence.persistTurn(store, .{
                 .history = session.agent.history.items,
                 .total_tokens = session.agent.total_tokens,
-            }, session_key, content, response);
+            }, session_key, persisted_content orelse content, persisted_response orelse response);
         }
 
         if (self.config.diagnostics.log_message_payloads) {
@@ -4478,6 +4490,42 @@ test "restored session reconstructs token count from persisted assistant replies
     var expected_line_buf: [64]u8 = undefined;
     const expected_line = try std.fmt.bufPrint(&expected_line_buf, "Tokens used: {d}", .{expected_tokens});
     try testing.expect(std.mem.indexOf(u8, status.?, expected_line) != null);
+}
+
+test "processMessage session persistence redacts PII" {
+    var mock = MockProvider{ .response = "assistant saw user@example.com" };
+    const cfg = testConfig();
+
+    var sqlite_mem = try memory_mod.SqliteMemory.init(testing.allocator, ":memory:");
+    defer sqlite_mem.deinit();
+
+    var noop = observability.NoopObserver{};
+    var sm = SessionManager.init(
+        testing.allocator,
+        &cfg,
+        mock.provider(),
+        &.{},
+        sqlite_mem.memory(),
+        noop.observer(),
+        sqlite_mem.sessionStore(),
+        null,
+    );
+    defer sm.deinit();
+
+    const session_key = "telegram:main:privacy";
+    const reply = try sm.processMessage(session_key, "hello user@example.com", null);
+    defer testing.allocator.free(reply);
+
+    const store = sqlite_mem.sessionStore();
+    const detailed = try store.loadMessagesDetailed(testing.allocator, session_key, 10, 0);
+    defer memory_mod.freeDetailedMessages(testing.allocator, detailed);
+
+    try testing.expectEqual(@as(usize, 2), detailed.len);
+    for (detailed) |message| {
+        try testing.expect(std.mem.indexOf(u8, message.content, "user@example.com") == null);
+    }
+    try testing.expect(std.mem.indexOf(u8, detailed[0].content, "[EMAIL_1]") != null);
+    try testing.expect(std.mem.indexOf(u8, detailed[1].content, "[EMAIL_1]") != null);
 }
 
 test "restored session token reconstruction ignores usage footer decorations" {
