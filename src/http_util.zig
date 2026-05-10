@@ -1097,6 +1097,7 @@ fn putProxyEnvVarFromProcess(
     if (std_compat.process.getEnvVarOwned(allocator, key)) |raw_value| {
         defer allocator.free(raw_value);
         if (try normalizeProxyEnvValue(allocator, raw_value)) |proxy| {
+            defer allocator.free(proxy);
             try env_map.put(key, proxy);
         }
     } else |_| {}
