@@ -22,6 +22,8 @@ services:
     build: *nullclaw-build
     profiles: ["agent"]
     user: "${NULLCLAW_UID:-65534}:${NULLCLAW_GID:-65534}"
+    group_add:
+      - "111"
     depends_on:
       init-data:
         condition: service_completed_successfully
@@ -43,6 +45,8 @@ services:
     build: *nullclaw-build
     profiles: ["gateway"]
     user: "${NULLCLAW_UID:-65534}:${NULLCLAW_GID:-65534}"
+    group_add:
+      - "111"
     depends_on:
       init-data:
         condition: service_completed_successfully
