@@ -135,15 +135,25 @@ test "canResolveExecutable rejects directory on PATH" {
 
     defer {
         if (old_path_z) |path| {
-            _ = c.setenv(key_z.ptr, path.ptr, 1);
+            _ = if (comptime builtin.os.tag == .windows)
+                c._putenv_s(key_z.ptr, path.ptr)
+            else
+                c.setenv(key_z.ptr, path.ptr, 1);
         } else {
-            _ = c.unsetenv(key_z.ptr);
+            _ = if (comptime builtin.os.tag == .windows)
+                c._putenv_s(key_z.ptr, "")
+            else
+                c.unsetenv(key_z.ptr);
         }
     }
 
     const bin_z = try std.testing.allocator.dupeZ(u8, bin_abs);
     defer std.testing.allocator.free(bin_z);
-    try std.testing.expectEqual(@as(c_int, 0), c.setenv(key_z.ptr, bin_z.ptr, 1));
+    const set_rc = if (comptime builtin.os.tag == .windows)
+        c._putenv_s(key_z.ptr, bin_z.ptr)
+    else
+        c.setenv(key_z.ptr, bin_z.ptr, 1);
+    try std.testing.expectEqual(@as(c_int, 0), set_rc);
 
     // Regression: executable resolution must reject directories with execute access.
     try std.testing.expect(!canResolveExecutable("nullclaw_probe_dir"));
