@@ -288,13 +288,21 @@ pub const Server = struct {
         var address: Address = undefined;
         var address_len: posix.socklen_t = @sizeOf(Address);
 
+        // accept4() with SOCK_CLOEXEC is preferred: it is atomic (no separate fcntl)
+        // and it is the only accept variant allowed by Android's seccomp policy.
+        // macOS/Haiku do not have accept4(), so fall back to accept() + fcntl there.
+        const have_accept4 = comptime builtin.os.tag == .linux;
+
         while (true) {
-            const rc = posix.system.accept(self.stream.handle, &address.any, &address_len);
+            const rc = if (have_accept4)
+                posix.system.accept4(self.stream.handle, &address.any, &address_len, posix.SOCK.CLOEXEC)
+            else
+                posix.system.accept(self.stream.handle, &address.any, &address_len);
             switch (posix.errno(rc)) {
                 .SUCCESS => {
                     var stream: Stream = .{ .handle = @intCast(rc) };
                     errdefer stream.close();
-                    try setSocketCloseOnExec(stream.handle);
+                    if (!have_accept4) try setSocketCloseOnExec(stream.handle);
                     try setSocketNonblocking(stream.handle, false);
                     return .{
                         .stream = stream,
@@ -524,6 +532,32 @@ test "compat net nonblocking listener accept reports WouldBlock when idle" {
     // Regression for #851: Zig 0.16 Threaded accept maps EAGAIN on externally
     // non-blocking listeners to Unexpected instead of WouldBlock.
     try std.testing.expectError(error.WouldBlock, server.accept());
+}
+
+test "compat net nonblocking listener accept4 accepted socket is blocking" {
+    if (builtin.os.tag == .windows or builtin.os.tag == .wasi) return;
+
+    // Regression: acceptPosixNonblocking used accept() which is blocked by Android
+    // seccomp policy (SIGSYS). It must use accept4(SOCK_CLOEXEC) instead.
+    // Verify that the path is exercised and the returned socket is blocking.
+    const addr = try Address.resolveIp("127.0.0.1", 0);
+    var server = try addr.listen(.{ .force_nonblocking = true });
+    defer server.deinit();
+
+    const client = try tcpConnectToAddress(server.listen_address);
+    defer client.close();
+
+    var conn = server.accept() catch |err| switch (err) {
+        error.WouldBlock => blk: {
+            std.Io.sleep(shared.io(), .fromNanoseconds(10 * std.time.ns_per_ms), .awake) catch {};
+            break :blk try server.accept();
+        },
+        else => return err,
+    };
+    defer conn.stream.close();
+
+    // Accepted socket must be blocking regardless of listener nonblocking mode.
+    try std.testing.expect(!socketIsNonblocking(conn.stream.handle));
 }
 
 test "compat net stream read receives small socket payload" {
