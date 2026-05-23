@@ -2198,10 +2198,25 @@ pub const TelegramChannel = struct {
     }
 
     fn resolveMessageContent(self: *TelegramChannel, allocator: std.mem.Allocator, message: std.json.Value) ?[]u8 {
-        return self.resolveVoiceOrAudioContent(allocator, message) orelse
+        const base = self.resolveVoiceOrAudioContent(allocator, message) orelse
             self.resolvePhotoContent(allocator, message) orelse
             self.resolveDocumentContent(allocator, message) orelse
             telegram_update_ingress.textOrCaption(allocator, message);
+
+        const base_content = base orelse return null;
+
+        // Telegram replies arrive with the original message in `reply_to_message`.
+        // Prepending it to the inbound payload gives the agent the conversational
+        // context the user clearly expected to be visible (issue #916).
+        const reply_text = telegram_update_ingress.replyToText(message) orelse return base_content;
+
+        const enriched = telegram_update_ingress.contentWithReplyContext(
+            allocator,
+            base_content,
+            reply_text,
+        ) catch return base_content;
+        allocator.free(base_content);
+        return enriched;
     }
 
     fn appendIncomingMessage(
