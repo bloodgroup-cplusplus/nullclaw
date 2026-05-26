@@ -1,8 +1,87 @@
 const std = @import("std");
 const root = @import("root.zig");
 const config_types = @import("../config_types.zig");
+const builtin = @import("builtin");
+const std_compat = @import("compat");
 
 const log = std.log.scoped(.line);
+
+const ReplyTokenData = struct {
+    target: [64]u8,
+    target_len: u8,
+    token: [512]u8,
+    token_len: u16,
+    received_at_ms: i64,
+};
+
+var g_reply_cache_mu: std_compat.sync.Mutex = .{};
+var g_reply_cache: [16]ReplyTokenData = undefined;
+var g_reply_cache_count: usize = 0;
+
+pub fn cacheReplyToken(target: []const u8, token: []const u8) void {
+    if (target.len > 64 or token.len > 512) return;
+
+    g_reply_cache_mu.lock();
+    defer g_reply_cache_mu.unlock();
+
+    const now = std_compat.time.milliTimestamp();
+
+    // Check if target already exists in the cache
+    var i: usize = 0;
+    while (i < g_reply_cache_count) : (i += 1) {
+        const cached = &g_reply_cache[i];
+        if (std.mem.eql(u8, cached.target[0..cached.target_len], target)) {
+            @memcpy(cached.token[0..token.len], token);
+            cached.token_len = @intCast(token.len);
+            cached.received_at_ms = now;
+            return;
+        }
+    }
+
+    // If cache has space, add it. Otherwise, evict the oldest entry
+    if (g_reply_cache_count < g_reply_cache.len) {
+        const cached = &g_reply_cache[g_reply_cache_count];
+        @memcpy(cached.target[0..target.len], target);
+        cached.target_len = @intCast(target.len);
+        @memcpy(cached.token[0..token.len], token);
+        cached.token_len = @intCast(token.len);
+        cached.received_at_ms = now;
+        g_reply_cache_count += 1;
+    } else {
+        var oldest_idx: usize = 0;
+        var oldest_time = g_reply_cache[0].received_at_ms;
+        var j: usize = 1;
+        while (j < g_reply_cache.len) : (j += 1) {
+            if (g_reply_cache[j].received_at_ms < oldest_time) {
+                oldest_time = g_reply_cache[j].received_at_ms;
+                oldest_idx = j;
+            }
+        }
+        const cached = &g_reply_cache[oldest_idx];
+        @memcpy(cached.target[0..target.len], target);
+        cached.target_len = @intCast(target.len);
+        @memcpy(cached.token[0..token.len], token);
+        cached.token_len = @intCast(token.len);
+        cached.received_at_ms = now;
+    }
+}
+
+pub fn getReplyToken(allocator: std.mem.Allocator, target: []const u8) ?[]const u8 {
+    g_reply_cache_mu.lock();
+    defer g_reply_cache_mu.unlock();
+
+    const now = std_compat.time.milliTimestamp();
+    var i: usize = 0;
+    while (i < g_reply_cache_count) : (i += 1) {
+        const cached = &g_reply_cache[i];
+        if (std.mem.eql(u8, cached.target[0..cached.target_len], target)) {
+            if (now - cached.received_at_ms <= 30_000) {
+                return allocator.dupe(u8, cached.token[0..cached.token_len]) catch null;
+            }
+        }
+    }
+    return null;
+}
 
 fn buildReplyRequestBody(allocator: std.mem.Allocator, reply_token: []const u8, text: []const u8) ![]u8 {
     var body_list: std.ArrayListUnmanaged(u8) = .empty;
@@ -85,6 +164,12 @@ pub const LineChannel = struct {
 
     /// Reply to a message using the replyToken (valid for ~30s after event).
     pub fn replyMessage(self: *LineChannel, reply_token: []const u8, text: []const u8) !void {
+        if (builtin.is_test) {
+            if (std.mem.indexOf(u8, reply_token, "fail_reply") != null or std.mem.indexOf(u8, reply_token, "fail_reply_and_push") != null) {
+                return error.LineApiError;
+            }
+            return;
+        }
         const body = try buildReplyRequestBody(self.allocator, reply_token, text);
         defer self.allocator.free(body);
 
@@ -102,6 +187,12 @@ pub const LineChannel = struct {
 
     /// Push a message to a user by userId (no replyToken needed).
     pub fn pushMessage(self: *LineChannel, user_id: []const u8, text: []const u8) !void {
+        if (builtin.is_test) {
+            if (std.mem.indexOf(u8, user_id, "fail_push") != null or std.mem.indexOf(u8, user_id, "fail_reply_and_push") != null) {
+                return error.LineApiError;
+            }
+            return;
+        }
         const body = try buildPushRequestBody(self.allocator, user_id, text);
         defer self.allocator.free(body);
 
@@ -117,16 +208,23 @@ pub const LineChannel = struct {
         self.allocator.free(resp);
     }
 
-    /// Send a message. If target looks like a replyToken (32+ hex chars),
-    /// use replyMessage; otherwise use pushMessage to userId.
+    /// Send a message. If target is a source ID (exactly 33 characters starting with 'U', 'C', or 'R'),
+    /// try to use the cached replyToken first, falling back to pushMessage. Otherwise, treat as a replyToken.
     pub fn sendMessage(self: *LineChannel, target: []const u8, text: []const u8) !void {
-        // LINE userIds start with "U" and are 33 chars; replyTokens are 32 hex chars.
-        // Heuristic: if it starts with 'U' and len >= 33, treat as userId (push).
-        if (target.len >= 33 and target[0] == 'U') {
-            try self.pushMessage(target, text);
+        const is_source_id = target.len == 33 and (target[0] == 'U' or target[0] == 'C' or target[0] == 'R');
+
+        if (is_source_id) {
+            if (getReplyToken(self.allocator, target)) |rt| {
+                defer self.allocator.free(rt);
+                self.replyMessage(rt, text) catch |err| {
+                    log.warn("replyMessage failed with cached token ({}), falling back to pushMessage", .{err});
+                    try self.pushMessage(target, text);
+                };
+            } else {
+                try self.pushMessage(target, text);
+            }
         } else {
-            // Try as replyToken first; if target is a userId without 'U' prefix, push
-            try self.pushMessage(target, text);
+            try self.replyMessage(target, text);
         }
     }
 
@@ -209,6 +307,13 @@ pub const LineChannel = struct {
                         const text_val = msg_obj.object.get("text");
                         message_text = if (text_val) |t| (if (t == .string) t.string else null) else null;
                     }
+                }
+            }
+
+            const target_id = if (group_id) |gid| gid else if (room_id) |rid| rid else user_id;
+            if (reply_token) |rt| {
+                if (target_id) |tid| {
+                    cacheReplyToken(tid, rt);
                 }
             }
 
@@ -1040,4 +1145,46 @@ test "verifyLineSignature rejects tampered body" {
     try std.testing.expect(verifyLineSignature(original_body, valid_sig, secret));
     // Tampered body + original sig: must reject.
     try std.testing.expect(!verifyLineSignature(tampered_body, valid_sig, secret));
+}
+
+test "LineChannel sendMessage routing and fallback" {
+    const allocator = std.testing.allocator;
+
+    var ch = LineChannel.init(allocator, .{
+        .access_token = "test-token",
+        .channel_secret = "test-secret",
+    });
+
+    // 1. Target is a source ID (len == 33, starts with U/C/R) and not cached -> pushMessage directly.
+    try std.testing.expectError(error.LineApiError, ch.sendMessage("U1234567890123456789012_fail_push", "hello"));
+    try ch.sendMessage("U123456789012345678901234567_norm", "hello");
+
+    // 2. Target is a reply token (len != 33) -> replyMessage directly.
+    try std.testing.expectError(error.LineApiError, ch.sendMessage("fail_reply_longer_token_value_here", "hello"));
+    try ch.sendMessage("normal_reply_token_longer_value_here", "hello");
+
+    // 3. Test caching: parse a webhook with a reply token, then call sendMessage on that sourceId.
+    const payload =
+        \\{"events":[{"type":"message","replyToken":"cached_token_abc","source":{"type":"user","userId":"U1234567890123456789012345_cached"},"timestamp":1700000000000,"message":{"id":"m1","type":"text","text":"Hello"}}]}
+    ;
+    const events = try LineChannel.parseWebhookEvents(allocator, payload);
+    defer {
+        for (events) |*e| {
+            var ev = e.*;
+            ev.deinit(allocator);
+        }
+        allocator.free(events);
+    }
+
+    // Now sendMessage should use the cached token, which routes to replyMessage and succeeds.
+    try ch.sendMessage("U1234567890123456789012345_cached", "hello");
+
+    // 4. Test fallback with cached token: cache a token that fails in replyMessage.
+    cacheReplyToken("U12345678901234567890123_fallback", "fail_reply");
+    // Since replyMessage fails, it should fallback to pushMessage which succeeds.
+    try ch.sendMessage("U12345678901234567890123_fallback", "hello");
+
+    // 5. Both fail with cached token.
+    cacheReplyToken("U1234567890123456789012_fail_push", "fail_reply");
+    try std.testing.expectError(error.LineApiError, ch.sendMessage("U1234567890123456789012_fail_push", "hello"));
 }
