@@ -760,16 +760,31 @@ fn parseTypedValue(comptime T: type, allocator: std.mem.Allocator, value: std.js
             .ignore_unknown_fields = true,
         }) catch null;
     } else |first_err| {
-        // Probe failed — try once more with numeric items in any array
-        // stringified, so one per-field type mistake doesn't nuke the account.
-        var coerced = value;
-        coerceArrayItemsToStrings(probe_allocator, &coerced) catch {
+        // Probe failed — try once more with integer items in string-list fields
+        // stringified, so one allow-list authoring mistake does not nuke the
+        // account. Clone first; std.json.Value arrays/objects are reference
+        // containers, and mutating a shallow copy would poison the parsed tree.
+        var coerced = cloneJsonValue(probe_allocator, value) catch {
             log.warn(
                 "channel account config failed to parse as {s}: {s}",
                 .{ @typeName(T), @errorName(first_err) },
             );
             return null;
         };
+        const did_coerce = coerceIntegerStringListFields(T, probe_allocator, &coerced) catch {
+            log.warn(
+                "channel account config failed to parse as {s}: {s}",
+                .{ @typeName(T), @errorName(first_err) },
+            );
+            return null;
+        };
+        if (!did_coerce) {
+            log.warn(
+                "channel account config failed to parse as {s}: {s}",
+                .{ @typeName(T), @errorName(first_err) },
+            );
+            return null;
+        }
 
         if (std.json.parseFromValueLeaky(T, probe_allocator, coerced, .{
             .ignore_unknown_fields = true,
@@ -787,38 +802,79 @@ fn parseTypedValue(comptime T: type, allocator: std.mem.Allocator, value: std.js
     }
 }
 
-/// Walk a `std.json.Value` tree in place, replacing every integer or float that
-/// sits inside an array with its decimal-string representation. Used as a
-/// permissive retry for channel account configs where users commonly put
-/// numeric identifiers (Telegram user IDs, chat IDs) into fields whose
-/// declared type is `[]const []const u8`. Scalar (non-array) numeric fields
-/// are untouched, so legitimate `port: u16 = 8080` style fields are preserved.
-fn coerceArrayItemsToStrings(allocator: std.mem.Allocator, value: *std.json.Value) !void {
-    switch (value.*) {
-        .array => |*arr| {
-            for (arr.items) |*item| {
-                switch (item.*) {
-                    .integer => |n| {
-                        const buf = try std.fmt.allocPrint(allocator, "{d}", .{n});
-                        item.* = .{ .string = buf };
-                    },
-                    .float => |f| {
-                        const buf = try std.fmt.allocPrint(allocator, "{d}", .{f});
-                        item.* = .{ .string = buf };
-                    },
-                    .array, .object => try coerceArrayItemsToStrings(allocator, item),
-                    else => {},
-                }
+fn cloneJsonValue(allocator: std.mem.Allocator, value: std.json.Value) !std.json.Value {
+    return switch (value) {
+        .array => |arr| blk: {
+            var cloned = std.json.Array.init(allocator);
+            try cloned.ensureTotalCapacity(arr.items.len);
+            for (arr.items) |item| {
+                try cloned.append(try cloneJsonValue(allocator, item));
             }
+            break :blk .{ .array = cloned };
         },
-        .object => |*obj| {
+        .object => |obj| blk: {
+            var cloned: std.json.ObjectMap = .empty;
             var it = obj.iterator();
             while (it.next()) |entry| {
-                try coerceArrayItemsToStrings(allocator, entry.value_ptr);
+                const gop = try cloned.getOrPut(allocator, entry.key_ptr.*);
+                gop.value_ptr.* = try cloneJsonValue(allocator, entry.value_ptr.*);
             }
+            break :blk .{ .object = cloned };
         },
-        else => {},
+        else => value,
+    };
+}
+
+fn isStringSlice(comptime T: type) bool {
+    return switch (@typeInfo(T)) {
+        .pointer => |ptr| ptr.size == .slice and ptr.child == u8,
+        else => false,
+    };
+}
+
+fn isStringList(comptime T: type) bool {
+    return switch (@typeInfo(T)) {
+        .pointer => |ptr| ptr.size == .slice and isStringSlice(ptr.child),
+        else => false,
+    };
+}
+
+/// Coerce integer JSON array items only for struct fields declared as
+/// `[]const []const u8`. This keeps channel string allow-lists permissive while
+/// leaving numeric scalar fields and non-string arrays strict.
+fn coerceIntegerStringListFields(
+    comptime T: type,
+    allocator: std.mem.Allocator,
+    value: *std.json.Value,
+) !bool {
+    if (value.* != .object) return false;
+
+    var changed = false;
+    inline for (std.meta.fields(T)) |field| {
+        if (comptime isStringList(field.type)) {
+            if (value.object.getPtr(field.name)) |field_value| {
+                changed = (try coerceIntegerArrayItemsToStrings(allocator, field_value)) or changed;
+            }
+        }
     }
+    return changed;
+}
+
+fn coerceIntegerArrayItemsToStrings(allocator: std.mem.Allocator, value: *std.json.Value) !bool {
+    if (value.* != .array) return false;
+
+    var changed = false;
+    for (value.array.items) |*item| {
+        switch (item.*) {
+            .integer => |n| {
+                const buf = try std.fmt.allocPrint(allocator, "{d}", .{n});
+                item.* = .{ .string = buf };
+                changed = true;
+            },
+            else => {},
+        }
+    }
+    return changed;
 }
 
 fn maybeSetAccountId(comptime T: type, allocator: std.mem.Allocator, parsed: *T, account_id: []const u8) !void {

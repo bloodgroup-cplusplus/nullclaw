@@ -6798,6 +6798,22 @@ test "parse telegram accounts accepts mixed string + integer allow_from" {
     allocator.free(cfg.channels.telegram);
 }
 
+test "parse telegram accounts accepts numeric group_allow_from" {
+    var arena = std.heap.ArenaAllocator.init(std.testing.allocator);
+    defer arena.deinit();
+    const allocator = arena.allocator();
+    const json =
+        \\{"channels": {"telegram": {"accounts": {"main": {"bot_token": "TOKEN", "group_allow_from": [-1001234567890]}}}}}
+    ;
+    var cfg = Config{ .workspace_dir = "/tmp/yc", .config_path = "/tmp/yc/config.json", .allocator = allocator };
+    try cfg.parseJson(json);
+
+    try std.testing.expectEqual(@as(usize, 1), cfg.channels.telegram.len);
+    const tg = cfg.channels.telegram[0];
+    try std.testing.expectEqual(@as(usize, 1), tg.group_allow_from.len);
+    try std.testing.expectEqualStrings("-1001234567890", tg.group_allow_from[0]);
+}
+
 test "parse discord accounts" {
     const allocator = std.testing.allocator;
     const json =
@@ -7136,6 +7152,22 @@ test "parse onebot multi-account sorted alphabetically" {
     try std.testing.expectEqualStrings("ws://east.local:6700", cfg.channels.onebot[0].url);
     try std.testing.expectEqualStrings("/bot", cfg.channels.onebot[0].group_trigger_prefix.?);
     try std.testing.expectEqualStrings("west", cfg.channels.onebot[1].account_id);
+}
+
+test "parse onebot accounts accepts numeric allow_from" {
+    var arena = std.heap.ArenaAllocator.init(std.testing.allocator);
+    defer arena.deinit();
+    const allocator = arena.allocator();
+    const json =
+        \\{"channels": {"onebot": {"accounts": {"main": {"allow_from": [123456789]}}}}}
+    ;
+    var cfg = Config{ .workspace_dir = "/tmp/yc", .config_path = "/tmp/yc/config.json", .allocator = allocator };
+    try cfg.parseJson(json);
+
+    try std.testing.expectEqual(@as(usize, 1), cfg.channels.onebot.len);
+    try std.testing.expectEqualStrings("main", cfg.channels.onebot[0].account_id);
+    try std.testing.expectEqual(@as(usize, 1), cfg.channels.onebot[0].allow_from.len);
+    try std.testing.expectEqualStrings("123456789", cfg.channels.onebot[0].allow_from[0]);
 }
 
 test "parse onebot account_id in payload is overridden by account key" {
