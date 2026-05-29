@@ -16,7 +16,6 @@
 //! 3) Optional fallback chain (`http_request.search_fallback_providers`).
 
 const std = @import("std");
-const builtin = @import("builtin");
 const root = @import("root.zig");
 const platform = @import("../platform.zig");
 const search_providers = @import("web_search_providers/root.zig");
@@ -369,10 +368,6 @@ pub fn formatSearxngResults(allocator: std.mem.Allocator, json_body: []const u8,
 // ══════════════════════════════════════════════════════════════════
 
 const testing = std.testing;
-const env_c = @cImport({
-    @cInclude("stdlib.h");
-});
-
 const search_api_key_env_vars = [_][]const u8{
     "BRAVE_API_KEY",
     "FIRECRAWL_API_KEY",
@@ -383,35 +378,17 @@ const search_api_key_env_vars = [_][]const u8{
     "WEB_SEARCH_API_KEY",
 };
 
-fn setProcessEnv(allocator: std.mem.Allocator, name: []const u8, value: ?[]const u8) !void {
-    const name_z = try allocator.dupeZ(u8, name);
-    defer allocator.free(name_z);
-
-    const rc: c_int = if (value) |env_value| blk: {
-        const value_z = try allocator.dupeZ(u8, env_value);
-        defer allocator.free(value_z);
-        break :blk if (comptime builtin.os.tag == .windows)
-            env_c._putenv_s(name_z.ptr, value_z.ptr)
-        else
-            env_c.setenv(name_z.ptr, value_z.ptr, 1);
-    } else if (comptime builtin.os.tag == .windows)
-        env_c._putenv_s(name_z.ptr, "")
-    else
-        env_c.unsetenv(name_z.ptr);
-
-    if (rc != 0) return error.EnvMutationFailed;
-}
-
 const SearchApiKeyEnvGuard = struct {
     values: [search_api_key_env_vars.len]?[]const u8 = [_]?[]const u8{null} ** search_api_key_env_vars.len,
 
     fn init(allocator: std.mem.Allocator) !SearchApiKeyEnvGuard {
         var guard = SearchApiKeyEnvGuard{};
         errdefer guard.deinit(allocator);
+        errdefer guard.restore(allocator) catch {};
 
         for (search_api_key_env_vars, 0..) |name, i| {
             guard.values[i] = platform.getEnvOrNull(allocator, name);
-            try setProcessEnv(allocator, name, null);
+            try platform.setProcessEnv(allocator, name, null);
         }
 
         return guard;
@@ -419,7 +396,7 @@ const SearchApiKeyEnvGuard = struct {
 
     fn restore(self: *const SearchApiKeyEnvGuard, allocator: std.mem.Allocator) !void {
         for (search_api_key_env_vars, 0..) |name, i| {
-            try setProcessEnv(allocator, name, self.values[i]);
+            try platform.setProcessEnv(allocator, name, self.values[i]);
         }
     }
 
@@ -461,6 +438,7 @@ test "WebSearchTool empty query fails" {
 }
 
 test "WebSearchTool without working provider chain returns aggregate error" {
+    // Regression: process-level web search API keys must not make this aggregate-failure test hit real providers.
     var env_guard = try SearchApiKeyEnvGuard.init(testing.allocator);
     defer env_guard.deinit(testing.allocator);
     defer restoreSearchApiKeyEnvOrPanic(testing.allocator, &env_guard);
