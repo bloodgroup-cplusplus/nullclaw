@@ -22,6 +22,7 @@
 | `/cron/pause` | POST | 公开绑定时或已存在配对 token 时需要 `Authorization: Bearer <token>` | 按 `id` 暂停实时 cron 任务 |
 | `/cron/resume` | POST | 公开绑定时或已存在配对 token 时需要 `Authorization: Bearer <token>` | 按 `id` 恢复实时 cron 任务 |
 | `/cron/update` | POST | 公开绑定时或已存在配对 token 时需要 `Authorization: Bearer <token>` | 部分更新实时 cron 任务 |
+| `/telegram` | POST | `X-Telegram-Bot-Api-Secret-Token` 必须匹配 `channels.telegram.accounts.<id>.webhook_secret` | Telegram 入站 webhook |
 | `/whatsapp` | GET | Query 参数 | Meta Webhook 验证 |
 | `/whatsapp` | POST | Meta 签名 | WhatsApp 入站消息 |
 | `/max` | POST | `X-Max-Bot-Api-Secret`（配置后必填） | Max 入站 webhook |
@@ -144,6 +145,7 @@ Teams webhook 说明：
 - 只接受 `audio/*` MIME type。
 - 实时桌面音频分片场景通常需要提高 `gateway.max_body_size_bytes`、`gateway.request_timeout_secs` 和 `gateway.webhook_rate_limit_per_minute`。
 - `tools.media.audio.models[0]` 选择 STT provider、model 和 endpoint。如果该 provider 没有 key，NullClaw 会在可用时回退到已配置 key 的 OpenAI/Groq/Telnyx provider。
+- 自定义 STT endpoint 对远程主机必须使用 HTTPS；明文 HTTP 只允许用于本地/内网 endpoint，且 URL 不允许包含 query 或 fragment。
 
 ## A2A（Agent-to-Agent 协议）
 

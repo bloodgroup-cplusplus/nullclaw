@@ -10,6 +10,7 @@ const builtin = @import("builtin");
 const platform = @import("platform.zig");
 const json_util = @import("json_util.zig");
 const http_util = @import("http_util.zig");
+const net_security = @import("net_security.zig");
 
 const log = std.log.scoped(.voice);
 
@@ -119,6 +120,21 @@ fn hasExplicitApiPath(url: []const u8) bool {
     return path.len > 0 and !std.mem.eql(u8, path, "/");
 }
 
+fn isSafeTranscriptionEndpointUrl(url: []const u8) bool {
+    const trimmed = std.mem.trim(u8, url, " \t\r\n");
+    if (trimmed.len == 0 or trimmed.len != url.len) return false;
+    if (std.mem.indexOfAny(u8, trimmed, " \t\r\n?#") != null) return false;
+
+    const uri = std.Uri.parse(trimmed) catch return false;
+    const is_https = std.ascii.eqlIgnoreCase(uri.scheme, "https");
+    const is_http = std.ascii.eqlIgnoreCase(uri.scheme, "http");
+    if (!is_https and !is_http) return false;
+
+    const host = net_security.extractHost(trimmed) orelse return false;
+    if (is_http and !net_security.isLocalHost(host)) return false;
+    return true;
+}
+
 /// Transcribe an audio file using the Groq Whisper API.
 ///
 /// Reads the file at `file_path`, builds a multipart/form-data request,
@@ -131,6 +147,8 @@ pub fn transcribeFile(
     file_path: []const u8,
     opts: TranscribeOptions,
 ) TranscribeError![]const u8 {
+    if (!isSafeTranscriptionEndpointUrl(endpoint)) return error.ApiRequestFailed;
+
     // Generate random boundary (16 hex chars)
     const boundary = generateBoundary() catch return error.BoundaryGenerationFailed;
 
@@ -371,11 +389,13 @@ fn curlPostFromFile(
     argv_buf[argc] = "POST";
     argc += 1;
 
-    for (headers) |hdr| {
-        if (argc + 2 > argv_buf.len) break;
+    var prepared_headers = try http_util.prepareCurlHeaderArg(allocator, headers);
+    defer prepared_headers.deinit(allocator);
+    if (prepared_headers.arg) |headers_arg| {
+        if (argc + 2 > argv_buf.len) return error.CurlFailed;
         argv_buf[argc] = "-H";
         argc += 1;
-        argv_buf[argc] = hdr;
+        argv_buf[argc] = headers_arg;
         argc += 1;
     }
 
@@ -726,10 +746,37 @@ test "voice transcriptionEndpointFromBaseUrl derives OpenAI-compatible paths" {
     }
 }
 
+test "voice transcription endpoint URL validation" {
+    try std.testing.expect(isSafeTranscriptionEndpointUrl("https://api.example.com/v1/audio/transcriptions"));
+    try std.testing.expect(isSafeTranscriptionEndpointUrl("http://localhost:9090/v1/audio/transcriptions"));
+    try std.testing.expect(!isSafeTranscriptionEndpointUrl("http://api.example.com/v1/audio/transcriptions"));
+    try std.testing.expect(!isSafeTranscriptionEndpointUrl("https://api.example.com/v1/audio/transcriptions?access_token=test"));
+    try std.testing.expect(!isSafeTranscriptionEndpointUrl("https://api.example.com/v1/audio/transcriptions#frag"));
+}
+
 test "voice transcribeFile returns error for nonexistent file" {
     const allocator = std.testing.allocator;
     const result = transcribeFile(allocator, "fake_key", "https://api.groq.com/openai/v1/audio/transcriptions", "/nonexistent/path/audio.ogg", .{});
     try std.testing.expectError(error.FileReadFailed, result);
+}
+
+test "voice transcribeFile rejects remote plaintext endpoint before request" {
+    const allocator = std.testing.allocator;
+    var tmp = std.testing.tmpDir(.{});
+    defer tmp.cleanup();
+
+    const base = try @import("compat").fs.Dir.wrap(tmp.dir).realpathAlloc(allocator, ".");
+    defer allocator.free(base);
+    const audio_path = try std.fmt.allocPrint(allocator, "{s}/audio.ogg", .{base});
+    defer allocator.free(audio_path);
+    {
+        const file = try std_compat.fs.createFileAbsolute(audio_path, .{});
+        defer file.close();
+        try file.writeAll("audio");
+    }
+
+    const result = transcribeFile(allocator, "fake_key", "http://api.example.com/v1/audio/transcriptions", audio_path, .{});
+    try std.testing.expectError(error.ApiRequestFailed, result);
 }
 
 test "voice transcribeTelegramVoice returns null without transcriber" {

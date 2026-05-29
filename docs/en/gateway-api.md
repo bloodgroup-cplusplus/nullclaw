@@ -36,6 +36,7 @@ Default gateway endpoint: `http://127.0.0.1:3000`
 | `/cron/pause` | POST | `Authorization: Bearer <token>` on public binds or when pairing tokens exist | Pause a live cron job by `id` |
 | `/cron/resume` | POST | `Authorization: Bearer <token>` on public binds or when pairing tokens exist | Resume a live cron job by `id` |
 | `/cron/update` | POST | `Authorization: Bearer <token>` on public binds or when pairing tokens exist | Partially update a live cron job |
+| `/telegram` | POST | `X-Telegram-Bot-Api-Secret-Token` matching `channels.telegram.accounts.<id>.webhook_secret` | Telegram inbound webhook |
 | `/whatsapp` | GET | Query params | Meta webhook verification |
 | `/whatsapp` | POST | Meta signature | WhatsApp inbound webhook |
 | `/max` | POST | `X-Max-Bot-Api-Secret` when configured | Max inbound webhook delivery |
@@ -158,6 +159,7 @@ Notes:
 - Only `audio/*` MIME types are accepted.
 - Raise `gateway.max_body_size_bytes`, `gateway.request_timeout_secs`, and `gateway.webhook_rate_limit_per_minute` for live desktop audio chunking.
 - `tools.media.audio.models[0]` selects the STT provider/model/endpoint. If that provider has no key, NullClaw falls back to a keyed OpenAI/Groq/Telnyx provider when available.
+- Custom STT endpoints must be HTTPS for remote hosts; plain HTTP is accepted only for local/private endpoints and URLs with query or fragment parts are rejected.
 
 ## A2A (Agent-to-Agent Protocol)
 
