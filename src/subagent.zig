@@ -385,6 +385,47 @@ pub const SubagentManager = struct {
         allocator: Allocator,
         session_key: ?[]const u8,
     ) ![]CompletionNotice {
+        return self.takeCompletionNoticesFiltered(allocator, .{ .session_key = session_key });
+    }
+
+    pub fn takeCompletionNoticesForOrigin(
+        self: *SubagentManager,
+        allocator: Allocator,
+        origin_channel: []const u8,
+        origin_account_id: ?[]const u8,
+    ) ![]CompletionNotice {
+        return self.takeCompletionNoticesFiltered(allocator, .{
+            .origin_channel = origin_channel,
+            .origin_account_id = origin_account_id,
+        });
+    }
+
+    const CompletionNoticeFilter = struct {
+        session_key: ?[]const u8 = null,
+        origin_channel: ?[]const u8 = null,
+        origin_account_id: ?[]const u8 = null,
+    };
+
+    fn taskMatchesNoticeFilter(state: *const TaskState, filter: CompletionNoticeFilter) bool {
+        if (filter.session_key) |expected_session| {
+            const state_session = state.session_key orelse return false;
+            if (!std.mem.eql(u8, state_session, expected_session)) return false;
+        }
+        if (filter.origin_channel) |expected_channel| {
+            if (!std.mem.eql(u8, state.origin_channel, expected_channel)) return false;
+        }
+        if (filter.origin_account_id) |expected_account| {
+            const state_account = state.origin_account_id orelse return false;
+            if (!std.mem.eql(u8, state_account, expected_account)) return false;
+        }
+        return true;
+    }
+
+    fn takeCompletionNoticesFiltered(
+        self: *SubagentManager,
+        allocator: Allocator,
+        filter: CompletionNoticeFilter,
+    ) ![]CompletionNotice {
         var notices: std.ArrayListUnmanaged(CompletionNotice) = .empty;
         errdefer {
             for (notices.items) |notice| freeNoticeFields(allocator, notice);
@@ -399,11 +440,7 @@ pub const SubagentManager = struct {
             const task_id = entry.key_ptr.*;
             const state = entry.value_ptr.*;
             if (state.status == .running or state.notified) continue;
-
-            if (session_key) |expected_session| {
-                const state_session = state.session_key orelse continue;
-                if (!std.mem.eql(u8, state_session, expected_session)) continue;
-            }
+            if (!taskMatchesNoticeFilter(state, filter)) continue;
 
             const content = formatTaskCompletionContent(allocator, state.label, state.result, state.error_msg) catch continue;
             const origin_channel_dup = allocator.dupe(u8, state.origin_channel) catch {
@@ -979,6 +1016,55 @@ test "CompletionNotice origin_account_id stays null when task has none" {
     try std.testing.expectEqual(@as(usize, 1), notices.len);
     try std.testing.expectEqualStrings("cli", notices[0].origin_channel);
     try std.testing.expect(notices[0].origin_account_id == null);
+}
+
+test "SubagentManager takeCompletionNoticesForOrigin preserves other accounts (regression #918)" {
+    const cfg = config_mod.Config{
+        .workspace_dir = "/tmp/yc",
+        .config_path = "/tmp/yc/config.json",
+        .allocator = std.testing.allocator,
+    };
+    var mgr = SubagentManager.init(std.testing.allocator, &cfg, null, .{});
+    defer mgr.deinit();
+
+    const main_state = try std.testing.allocator.create(TaskState);
+    main_state.* = .{
+        .status = .running,
+        .label = try std.testing.allocator.dupe(u8, "main-account-task"),
+        .origin_channel = try std.testing.allocator.dupe(u8, "telegram"),
+        .origin_chat_id = try std.testing.allocator.dupe(u8, "chat-main"),
+        .origin_account_id = try std.testing.allocator.dupe(u8, "main"),
+        .session_key = try std.testing.allocator.dupe(u8, "telegram:main:chat-main"),
+        .started_at = std_compat.time.milliTimestamp(),
+    };
+    try mgr.tasks.put(std.testing.allocator, 1, main_state);
+
+    const secondary_state = try std.testing.allocator.create(TaskState);
+    secondary_state.* = .{
+        .status = .running,
+        .label = try std.testing.allocator.dupe(u8, "secondary-account-task"),
+        .origin_channel = try std.testing.allocator.dupe(u8, "telegram"),
+        .origin_chat_id = try std.testing.allocator.dupe(u8, "chat-secondary"),
+        .origin_account_id = try std.testing.allocator.dupe(u8, "secondary"),
+        .session_key = try std.testing.allocator.dupe(u8, "telegram:secondary:chat-secondary"),
+        .started_at = std_compat.time.milliTimestamp(),
+    };
+    try mgr.tasks.put(std.testing.allocator, 2, secondary_state);
+
+    mgr.completeTask(1, "main done", null);
+    mgr.completeTask(2, "secondary done", null);
+
+    const main_notices = try mgr.takeCompletionNoticesForOrigin(std.testing.allocator, "telegram", "main");
+    defer SubagentManager.freeCompletionNotices(std.testing.allocator, main_notices);
+    try std.testing.expectEqual(@as(usize, 1), main_notices.len);
+    try std.testing.expectEqual(@as(u64, 1), main_notices[0].task_id);
+    try std.testing.expectEqualStrings("chat-main", main_notices[0].origin_chat_id);
+
+    const secondary_notices = try mgr.takeCompletionNoticesForOrigin(std.testing.allocator, "telegram", "secondary");
+    defer SubagentManager.freeCompletionNotices(std.testing.allocator, secondary_notices);
+    try std.testing.expectEqual(@as(usize, 1), secondary_notices.len);
+    try std.testing.expectEqual(@as(u64, 2), secondary_notices[0].task_id);
+    try std.testing.expectEqualStrings("chat-secondary", secondary_notices[0].origin_chat_id);
 }
 
 test "SubagentManager spawn stores session key" {

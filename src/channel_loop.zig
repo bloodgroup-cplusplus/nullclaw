@@ -1419,6 +1419,64 @@ pub const ChannelRuntime = struct {
     }
 };
 
+// Polling subagent result delivery helpers.
+const SubagentResultDelivery = struct {
+    channel: []const u8,
+    account_id: []const u8,
+    send_ctx: *anyopaque,
+    send_fn: *const fn (*anyopaque, []const u8, []const u8) anyerror!void,
+};
+
+/// Drain completed subagent results and deliver each one whose origin
+/// matches this polling channel account.
+/// In polling mode (`nullclaw channel start <channel>`) the subagent
+/// manager has no event bus, so `completeTask()` cannot publish outbound.
+/// Instead the result is parked on `TaskState` and collected here on the
+/// next polling tick.
+fn drainPollingSubagentResults(
+    allocator: std.mem.Allocator,
+    manager: ?*subagent_mod.SubagentManager,
+    delivery: SubagentResultDelivery,
+) void {
+    const mgr = manager orelse return;
+    const notices = mgr.takeCompletionNoticesForOrigin(allocator, delivery.channel, delivery.account_id) catch |err| {
+        log.warn("subagent notice drain failed: {}", .{err});
+        return;
+    };
+    defer subagent_mod.SubagentManager.freeCompletionNotices(allocator, notices);
+
+    for (notices) |notice| {
+        delivery.send_fn(delivery.send_ctx, notice.origin_chat_id, notice.content) catch |err| {
+            log.err("failed to deliver subagent result to {s} chat {s}: {}", .{ delivery.channel, notice.origin_chat_id, err });
+        };
+    }
+}
+
+fn sendTelegramSubagentResult(ctx: *anyopaque, chat_id: []const u8, content: []const u8) !void {
+    const tg_ptr: *telegram.TelegramChannel = @ptrCast(@alignCast(ctx));
+    try tg_ptr.sendMessage(chat_id, content);
+}
+
+fn sendSignalSubagentResult(ctx: *anyopaque, chat_id: []const u8, content: []const u8) !void {
+    const sg_ptr: *signal.SignalChannel = @ptrCast(@alignCast(ctx));
+    try sg_ptr.sendMessage(chat_id, content, &.{});
+}
+
+fn sendWeixinSubagentResult(ctx: *anyopaque, chat_id: []const u8, content: []const u8) !void {
+    const wx_ptr: *weixin.WeixinChannel = @ptrCast(@alignCast(ctx));
+    try wx_ptr.sendMessage(chat_id, content);
+}
+
+fn sendMatrixSubagentResult(ctx: *anyopaque, chat_id: []const u8, content: []const u8) !void {
+    const mx_ptr: *matrix.MatrixChannel = @ptrCast(@alignCast(ctx));
+    try mx_ptr.sendMessage(chat_id, content);
+}
+
+fn sendMaxSubagentResult(ctx: *anyopaque, chat_id: []const u8, content: []const u8) !void {
+    const mx_ptr: *max_mod.MaxChannel = @ptrCast(@alignCast(ctx));
+    try mx_ptr.sendMessage(chat_id, content);
+}
+
 // ════════════════════════════════════════════════════════════════════════════
 // runTelegramLoop — polling thread function
 // ════════════════════════════════════════════════════════════════════════════
@@ -1430,41 +1488,6 @@ pub const ChannelRuntime = struct {
 /// `tg_ptr` is the channel instance owned by the supervisor (ChannelManager).
 /// The polling loop uses it directly instead of creating a second
 /// TelegramChannel, so health checks and polling operate on the same object.
-/// Drain completed subagent results and deliver each one whose origin
-/// matches this Telegram account via `tg_ptr.sendMessage`.
-/// In polling mode (`nullclaw channel start telegram`) the subagent
-/// manager has no event bus, so `completeTask()` cannot publish outbound
-/// — instead the result is parked on `TaskState` and later collected
-/// here on the next polling tick.
-fn drainTelegramSubagentResults(
-    allocator: std.mem.Allocator,
-    runtime: *ChannelRuntime,
-    tg_ptr: *telegram.TelegramChannel,
-) void {
-    const mgr = runtime.subagent_manager orelse return;
-    const notices = mgr.takeCompletionNoticesForSession(allocator, null) catch |err| {
-        log.warn("subagent notice drain failed: {}", .{err});
-        return;
-    };
-    defer subagent_mod.SubagentManager.freeCompletionNotices(allocator, notices);
-
-    for (notices) |notice| {
-        if (!std.mem.eql(u8, notice.origin_channel, "telegram")) {
-            log.warn("subagent result for non-telegram channel '{s}' dropped in telegram polling loop", .{notice.origin_channel});
-            continue;
-        }
-        if (notice.origin_account_id) |aid| {
-            if (!std.mem.eql(u8, aid, tg_ptr.account_id)) {
-                log.warn("subagent result for telegram account '{s}' dropped (this loop owns '{s}')", .{ aid, tg_ptr.account_id });
-                continue;
-            }
-        }
-        tg_ptr.sendMessage(notice.origin_chat_id, notice.content) catch |err| {
-            log.err("failed to deliver subagent result to telegram chat {s}: {}", .{ notice.origin_chat_id, err });
-        };
-    }
-}
-
 pub fn runTelegramLoop(
     allocator: std.mem.Allocator,
     config: *const Config,
@@ -1810,10 +1833,12 @@ pub fn runTelegramLoop(
             _ = runtime.session_mgr.evictIdle(config.agent.session_idle_timeout_secs);
         }
 
-        // Deliver any subagent results that completed between polls.
-        // Without this, spawn-tool results are parked on TaskState forever
-        // in polling mode (see drainTelegramSubagentResults docstring).
-        drainTelegramSubagentResults(allocator, runtime, tg_ptr);
+        drainPollingSubagentResults(allocator, runtime.subagent_manager, .{
+            .channel = "telegram",
+            .account_id = tg_ptr.account_id,
+            .send_ctx = @ptrCast(tg_ptr),
+            .send_fn = sendTelegramSubagentResult,
+        });
 
         health.markComponentOk("telegram");
     }
@@ -1981,6 +2006,13 @@ pub fn runSignalLoop(
             _ = runtime.session_mgr.evictIdle(config.agent.session_idle_timeout_secs);
         }
 
+        drainPollingSubagentResults(allocator, runtime.subagent_manager, .{
+            .channel = "signal",
+            .account_id = sg_ptr.account_id,
+            .send_ctx = @ptrCast(sg_ptr),
+            .send_fn = sendSignalSubagentResult,
+        });
+
         health.markComponentOk("signal");
     }
 }
@@ -2080,6 +2112,13 @@ pub fn runWeixinLoop(
             evict_counter = 0;
             _ = runtime.session_mgr.evictIdle(config.agent.session_idle_timeout_secs);
         }
+
+        drainPollingSubagentResults(allocator, runtime.subagent_manager, .{
+            .channel = "weixin",
+            .account_id = wx_ptr.config.account_id,
+            .send_ctx = @ptrCast(wx_ptr),
+            .send_fn = sendWeixinSubagentResult,
+        });
 
         health.markComponentOk("weixin");
     }
@@ -2340,6 +2379,13 @@ pub fn runMatrixLoop(
             _ = runtime.session_mgr.evictIdle(config.agent.session_idle_timeout_secs);
         }
 
+        drainPollingSubagentResults(allocator, runtime.subagent_manager, .{
+            .channel = "matrix",
+            .account_id = mx_ptr.account_id,
+            .send_ctx = @ptrCast(mx_ptr),
+            .send_fn = sendMatrixSubagentResult,
+        });
+
         health.markComponentOk("matrix");
     }
 }
@@ -2498,6 +2544,13 @@ pub fn runMaxLoop(
             _ = runtime.session_mgr.evictIdle(config.agent.session_idle_timeout_secs);
         }
 
+        drainPollingSubagentResults(allocator, runtime.subagent_manager, .{
+            .channel = "max",
+            .account_id = mx_ptr.account_id,
+            .send_ctx = @ptrCast(mx_ptr),
+            .send_fn = sendMaxSubagentResult,
+        });
+
         health.markComponentOk("max");
     }
 }
@@ -2527,6 +2580,82 @@ test "TelegramLoopState last_activity update" {
     state.last_activity.store(std_compat.time.timestamp(), .release);
     const after = state.last_activity.load(.acquire);
     try std.testing.expect(after >= before);
+}
+
+test "polling subagent drain delivers only matching origin account" {
+    const FakeDelivery = struct {
+        count: usize = 0,
+        saw_expected_chat: bool = false,
+        saw_expected_content: bool = false,
+
+        fn send(ctx: *anyopaque, chat_id: []const u8, content: []const u8) !void {
+            const self: *@This() = @ptrCast(@alignCast(ctx));
+            self.count += 1;
+            self.saw_expected_chat = std.mem.eql(u8, chat_id, "signal-chat");
+            self.saw_expected_content = std.mem.indexOf(u8, content, "signal-task") != null;
+        }
+    };
+
+    const allocator = std.testing.allocator;
+    const cfg = Config{
+        .workspace_dir = "/tmp/yc",
+        .config_path = "/tmp/yc/config.json",
+        .allocator = allocator,
+    };
+    var mgr = subagent_mod.SubagentManager.init(allocator, &cfg, null, .{});
+    defer mgr.deinit();
+
+    const signal_state = try allocator.create(subagent_mod.TaskState);
+    signal_state.* = .{
+        .status = .completed,
+        .label = try allocator.dupe(u8, "signal-task"),
+        .origin_channel = try allocator.dupe(u8, "signal"),
+        .origin_chat_id = try allocator.dupe(u8, "signal-chat"),
+        .origin_account_id = try allocator.dupe(u8, "signal-main"),
+        .session_key = try allocator.dupe(u8, "signal:signal-main:signal-chat"),
+        .result = try allocator.dupe(u8, "signal done"),
+        .started_at = std_compat.time.milliTimestamp(),
+        .completed_at = std_compat.time.milliTimestamp(),
+    };
+    try mgr.tasks.put(allocator, 1, signal_state);
+
+    const telegram_state = try allocator.create(subagent_mod.TaskState);
+    telegram_state.* = .{
+        .status = .completed,
+        .label = try allocator.dupe(u8, "telegram-task"),
+        .origin_channel = try allocator.dupe(u8, "telegram"),
+        .origin_chat_id = try allocator.dupe(u8, "telegram-chat"),
+        .origin_account_id = try allocator.dupe(u8, "telegram-main"),
+        .session_key = try allocator.dupe(u8, "telegram:telegram-main:telegram-chat"),
+        .result = try allocator.dupe(u8, "telegram done"),
+        .started_at = std_compat.time.milliTimestamp(),
+        .completed_at = std_compat.time.milliTimestamp(),
+    };
+    try mgr.tasks.put(allocator, 2, telegram_state);
+
+    var delivery = FakeDelivery{};
+
+    // Regression: polling drains must not consume completed tasks for
+    // another channel/account before that channel loop can deliver them.
+    drainPollingSubagentResults(allocator, &mgr, .{
+        .channel = "signal",
+        .account_id = "signal-main",
+        .send_ctx = @ptrCast(&delivery),
+        .send_fn = FakeDelivery.send,
+    });
+
+    try std.testing.expectEqual(@as(usize, 1), delivery.count);
+    try std.testing.expect(delivery.saw_expected_chat);
+    try std.testing.expect(delivery.saw_expected_content);
+
+    const telegram_notices = try mgr.takeCompletionNoticesForOrigin(allocator, "telegram", "telegram-main");
+    defer subagent_mod.SubagentManager.freeCompletionNotices(allocator, telegram_notices);
+    try std.testing.expectEqual(@as(usize, 1), telegram_notices.len);
+    try std.testing.expectEqual(@as(u64, 2), telegram_notices[0].task_id);
+
+    const signal_notices = try mgr.takeCompletionNoticesForOrigin(allocator, "signal", "signal-main");
+    defer subagent_mod.SubagentManager.freeCompletionNotices(allocator, signal_notices);
+    try std.testing.expectEqual(@as(usize, 0), signal_notices.len);
 }
 
 test "shouldSuppressGroupReply suppresses only group replies with marker" {
