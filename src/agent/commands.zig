@@ -498,7 +498,8 @@ fn renderInteractiveModelMenu(self: anytype, provider_name: []const u8, page_num
     defer if (cfg_opt) |*cfg| cfg.deinit();
 
     const api_key = if (cfg_opt) |*cfg| cfg.getProviderKey(provider_name) else null;
-    const models = onboard.fetchModels(self.allocator, provider_name, api_key) catch return null;
+    const base_url = if (cfg_opt) |*cfg| cfg.getProviderBaseUrl(provider_name) else null;
+    const models = onboard.fetchModels(self.allocator, provider_name, api_key, base_url) catch return null;
     defer freeOwnedStringSlice(self.allocator, models);
 
     return renderInteractiveModelMenuFromModels(
