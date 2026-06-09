@@ -123,6 +123,7 @@ pub const known_providers = [_]ProviderInfo{
     .{ .key = "venice", .label = "Venice", .default_model = "llama-4-70b-instruct", .env_var = "VENICE_API_KEY" },
     .{ .key = "nearai", .label = "NEAR AI Cloud", .default_model = "zai-org/GLM-5.1-FP8", .env_var = "NEARAI_API_KEY" },
     .{ .key = "atlas-cloud", .label = "Atlas Cloud", .default_model = "qwen/qwen3-32b", .env_var = "ATLASCLOUD_API_KEY" },
+    .{ .key = "evolink", .label = "Evolink", .default_model = "gpt-5.2", .env_var = "EVOLINK_API_KEY" },
     .{ .key = "moonshot", .label = "Moonshot (Kimi)", .default_model = "kimi-k2.5", .env_var = "MOONSHOT_API_KEY" },
     .{ .key = "xiaomi", .label = "Xiaomi MiMo", .default_model = "mimo-v2-pro", .env_var = "MIMO_API_KEY" },
     .{ .key = "synthetic", .label = "Synthetic", .default_model = "synthetic-model", .env_var = "SYNTHETIC_API_KEY" },
@@ -3524,6 +3525,7 @@ test "defaultModelForProvider returns known models" {
     try std.testing.expectEqualStrings("qwen/qwen3-32b", defaultModelForProvider("atlas-cloud"));
     try std.testing.expectEqualStrings("qwen/qwen3-32b", defaultModelForProvider("atlas"));
     try std.testing.expectEqualStrings("qwen/qwen3-32b", defaultModelForProvider("atlascloud"));
+    try std.testing.expectEqualStrings("gpt-5.2", defaultModelForProvider("evolink"));
     try std.testing.expectEqualStrings("mimo-v2-pro", defaultModelForProvider("xiaomi"));
     try std.testing.expectEqualStrings("mimo-v2-pro", defaultModelForProvider("mimo"));
     try std.testing.expectEqualStrings("llama4", defaultModelForProvider("ollama"));
@@ -3543,6 +3545,7 @@ test "providerEnvVar known providers" {
     try std.testing.expectEqualStrings("NEARAI_API_KEY", providerEnvVar("nearai"));
     try std.testing.expectEqualStrings("ATLASCLOUD_API_KEY", providerEnvVar("atlas-cloud"));
     try std.testing.expectEqualStrings("ATLASCLOUD_API_KEY", providerEnvVar("atlas"));
+    try std.testing.expectEqualStrings("EVOLINK_API_KEY", providerEnvVar("evolink"));
     try std.testing.expectEqualStrings("MIMO_API_KEY", providerEnvVar("xiaomi"));
     try std.testing.expectEqualStrings("API_KEY", providerEnvVar("ollama"));
 }
@@ -4799,6 +4802,10 @@ test "fallbackModelsForProvider uses provider defaults for uncataloged providers
     const atlas_models = fallbackModelsForProvider("atlas");
     try std.testing.expect(atlas_models.len >= 1);
     try std.testing.expectEqualStrings("qwen/qwen3-32b", atlas_models[0]);
+
+    const evolink_models = fallbackModelsForProvider("evolink");
+    try std.testing.expect(evolink_models.len >= 1);
+    try std.testing.expectEqualStrings("gpt-5.2", evolink_models[0]);
 }
 
 test "parseModelIds extracts IDs from OpenRouter-style response and sorts them" {
